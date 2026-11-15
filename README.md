@@ -1,6 +1,6 @@
 # go-nacos
 
-Nacos 的 Go 原生服务端实现，与官方 Nacos 2.x/3.x gRPC SDK 线级兼容，目标是打造生产可用的 Go 版 Nacos。
+Nacos 的 Go 原生服务端实现，与官方 Nacos 2.x/3.x gRPC SDK 线级兼容，用于学习研究。
 
 - 命名服务：临时实例内存态，活性 = 连接
 - 配置中心：hashicorp/raft + bbolt 嵌入式存储

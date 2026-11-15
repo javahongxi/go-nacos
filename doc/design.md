@@ -2,7 +2,7 @@
 
 ## 定位
 
-go-nacos 是 Nacos 的 Go 原生实现：一个与官方 Nacos 2.x/3.x gRPC SDK 线级兼容的服务端，配置中心基于 raft + 嵌入式存储。目标是打造生产可用的 Go 版 Nacos，以官方 SDK 协议兼容为准绳，以 raft 保证配置的一致性持久性。
+go-nacos 是 Nacos 的 Go 原生实现：一个与官方 Nacos 2.x/3.x gRPC SDK 线级兼容的服务端，配置中心基于 raft + 嵌入式存储。项目用于学习研究，以官方 SDK 协议兼容为准绳，以 raft 保证配置的一致性持久性。
 
 - **不做** 1.x HTTP OpenAPI、鉴权、持久实例、1.x UDP 推送；控制台为自建观测台（`internal/admin`，读 + 有限写），不复用 Java/r-nacos 的 HTTP 管理面。
 - **配置中心**：hashicorp/raft + 嵌入式存储（bbolt），写路径全部过 raft，M1 单节点即具备完整复制/快照/恢复骨架，M2 补齐 join/leader 路由与全节点变更通知。
