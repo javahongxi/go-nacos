@@ -34,3 +34,6 @@ go.work.sum
 
 # go-nacos runtime data (raft logs, snapshots, bbolt)
 data/
+data-cluster/
+bin/
+logs/
