@@ -4,6 +4,7 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -404,7 +405,7 @@ func TestAdminReadOnly(t *testing.T) {
 		t.Fatalf("frontend status=%d, body lacks title", resp.StatusCode)
 	}
 
-	// Read-only: a write method must be rejected with 405.
+	// The list route stays GET-only: a write method is rejected with 405.
 	pr, err := http.Post(base+"/api/configs", "application/json", nil)
 	if err != nil {
 		t.Fatalf("POST: %v", err)
@@ -500,5 +501,134 @@ func TestNamingEmptyServiceClean(t *testing.T) {
 	waitHosts(t, consumer.Updates(), 1)
 	if h := consumer.Handshakes(); h != 1 {
 		t.Fatalf("consumer handshakes = %d, want 1 (no reconnect)", h)
+	}
+}
+
+// TestAdminWrites proves console writes flow through the same domain paths as
+// the SDK: raft-backed config writes are visible to SDK queries and watchers,
+// CAS conflicts surface as 409, and naming overrides never touch connections.
+func TestAdminWrites(t *testing.T) {
+	a := newApp(t, t.TempDir())
+	cfg := newConfig(t, a.Addr())
+	provider := newNaming(t, a.Addr())
+	consumer := newNaming(t, a.Addr())
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	base := "http://" + a.AdminAddr()
+
+	// 1. Create via admin; the SDK must see it (same raft path).
+	adminWrite(t, http.MethodPost, base+"/api/config", map[string]any{
+		"dataId": "w.yaml", "group": "DEFAULT_GROUP", "tenant": "public", "content": "v1", "type": "yaml",
+	}, http.StatusOK)
+	key := nacos.ConfigKey{DataID: "w.yaml", Group: "DEFAULT_GROUP"}
+	got, err := cfg.Query(ctx, key)
+	if err != nil || got.Content != "v1" || got.MD5 == "" {
+		t.Fatalf("sdk query after admin publish: %+v err=%v", got, err)
+	}
+
+	// 2. Admin edit with CAS must reach the SDK watcher (notify path).
+	updates := make(chan nacos.Config, 8)
+	if err := cfg.Watch(ctx, key, func(c nacos.Config) { updates <- c }); err != nil {
+		t.Fatalf("watch: %v", err)
+	}
+	select {
+	case seed := <-updates:
+		if seed.Content != "v1" {
+			t.Fatalf("watch seed = %q, want v1", seed.Content)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("watch seed never arrived")
+	}
+	adminWrite(t, http.MethodPost, base+"/api/config", map[string]any{
+		"dataId": "w.yaml", "content": "v2", "expectMd5": got.MD5,
+	}, http.StatusOK)
+	select {
+	case upd := <-updates:
+		if upd.Content != "v2" {
+			t.Fatalf("watch update = %q, want v2", upd.Content)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("admin edit never reached the SDK watcher")
+	}
+
+	// 3. Stale CAS loses with 409.
+	adminWrite(t, http.MethodPost, base+"/api/config", map[string]any{
+		"dataId": "w.yaml", "content": "v3", "expectMd5": got.MD5,
+	}, http.StatusConflict)
+
+	// 4. Admin delete → SDK ErrNotFound.
+	adminWrite(t, http.MethodDelete, base+"/api/config?dataId=w.yaml&group=DEFAULT_GROUP&tenant=public", nil, http.StatusOK)
+	if _, err := cfg.Query(ctx, key); !errors.Is(err, nacos.ErrNotFound) {
+		t.Fatalf("query after admin delete: err = %v, want ErrNotFound", err)
+	}
+
+	// 5. Force-offline an instance without disconnecting its provider.
+	const svc = "write.Svc"
+	inst := nacos.Instance{IP: "127.0.0.1", Port: 23000, Weight: 1, Healthy: true, Enabled: true, Ephemeral: true}
+	if err := provider.Register(ctx, svc, inst); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if _, err := consumer.Subscribe(ctx, svc); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	instURL := base + "/api/instance?name=write.Svc&group=DEFAULT_GROUP&namespace=public&ip=127.0.0.1&port=23000&cluster=DEFAULT"
+	adminWrite(t, http.MethodDelete, instURL, nil, http.StatusOK)
+	waitHosts(t, consumer.Updates(), 0)
+	if h := provider.Handshakes(); h != 1 {
+		t.Fatalf("provider handshakes = %d, want 1 (still connected)", h)
+	}
+
+	// 6. Service delete guards: non-empty → 409; empty → 200; subscribers survive.
+	if err := provider.Register(ctx, svc, inst); err != nil {
+		t.Fatalf("re-register: %v", err)
+	}
+	waitHosts(t, consumer.Updates(), 1)
+	svcURL := base + "/api/service?name=write.Svc&group=DEFAULT_GROUP&namespace=public"
+	adminWrite(t, http.MethodDelete, svcURL, nil, http.StatusConflict)
+	adminWrite(t, http.MethodDelete, instURL, nil, http.StatusOK)
+	waitHosts(t, consumer.Updates(), 0)
+	adminWrite(t, http.MethodDelete, svcURL, nil, http.StatusOK)
+	var services []struct {
+		Name string `json:"name"`
+	}
+	adminGet(t, base+"/api/services", &services)
+	for _, s := range services {
+		if s.Name == svc {
+			t.Fatal("service still listed after delete")
+		}
+	}
+	// The original consumer (no reconnect) still gets the push on re-register.
+	if err := provider.Register(ctx, svc, inst); err != nil {
+		t.Fatalf("re-register after delete: %v", err)
+	}
+	waitHosts(t, consumer.Updates(), 1)
+	if h := consumer.Handshakes(); h != 1 {
+		t.Fatalf("consumer handshakes = %d, want 1 (no reconnect)", h)
+	}
+}
+
+func adminWrite(t *testing.T, method, url string, body any, wantStatus int) {
+	t.Helper()
+	var rd io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		rd = bytes.NewReader(b)
+	}
+	req, err := http.NewRequest(method, url, rd)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, url, err)
+	}
+	defer resp.Body.Close()
+	msg, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != wantStatus {
+		t.Fatalf("%s %s status=%d, want %d (body=%s)", method, url, resp.StatusCode, wantStatus, msg)
 	}
 }

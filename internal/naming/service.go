@@ -151,6 +151,54 @@ func (s *Service) Deregister(k Key, inst wire.Instance, connID string) {
 	}
 }
 
+// Errors returned by DeleteService.
+var (
+	ErrServiceNotFound = errors.New("naming: service not found")
+	ErrServiceNotEmpty = errors.New("naming: service still has instances")
+)
+
+// AdminDeregister force-removes an instance regardless of which connection
+// owns it — the console override. The owning client is NOT disconnected; it
+// simply stops being listed until it re-registers (e.g. on reconnect replay).
+func (s *Service) AdminDeregister(k Key, ip string, port int, cluster string) bool {
+	if cluster == "" {
+		cluster = "DEFAULT"
+	}
+	ik := fmt.Sprintf("%s#%d#%s", ip, port, cluster)
+	s.mu.Lock()
+	st := s.services[k.String()]
+	removed := false
+	if st != nil {
+		if _, ok := st.instances[ik]; ok {
+			delete(st.instances, ik)
+			st.lastUpdated = time.Now().UnixMilli()
+			removed = true
+		}
+	}
+	s.mu.Unlock()
+	if removed {
+		go s.push(k)
+	}
+	return removed
+}
+
+// DeleteService drops an empty service shell on demand (console override of
+// the cleaner). Like the cleaner, it leaves the subscriber index intact, so a
+// later registration still pushes to the original subscribers.
+func (s *Service) DeleteService(k Key) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := s.services[k.String()]
+	if st == nil {
+		return ErrServiceNotFound
+	}
+	if len(st.instances) > 0 {
+		return ErrServiceNotEmpty
+	}
+	delete(s.services, k.String())
+	return nil
+}
+
 func (s *Service) Query(k Key, cluster string, healthyOnly bool) wire.ServiceInfo {
 	return s.snapshot(k, cluster, healthyOnly)
 }

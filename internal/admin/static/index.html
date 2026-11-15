@@ -36,6 +36,17 @@
   pre { background:#0c1116; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; max-height:340px; margin:0; }
   .empty { color:var(--mut); padding:24px; text-align:center; }
   label { color:var(--mut); font-size:12px; display:flex; align-items:center; gap:6px; }
+  .toolbar { display:flex; gap:8px; align-items:center; margin-bottom:10px; }
+  .form { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; margin-bottom:14px; }
+  .form h3 { margin:0 0 10px; font-size:14px; }
+  .form .grid { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:10px; }
+  .form label { flex-direction:column; align-items:flex-start; gap:4px; }
+  .form input, .form textarea { background:#0c1116; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 8px; font:13px ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .form input { width:180px; }
+  .form textarea { width:100%; resize:vertical; }
+  .form input[readonly] { color:var(--mut); }
+  td button { padding:2px 8px; font-size:12px; }
+  td button[disabled] { opacity:.4; cursor:not-allowed; }
 </style>
 </head>
 <body>
@@ -53,7 +64,7 @@
   <button data-tab="connections">连接</button>
   <button data-tab="raft">Raft</button>
 </nav>
-<main id="view"></main>
+<main><div id="editor"></div><div id="view"></div></main>
 
 <script>
 const $ = s => document.querySelector(s);
@@ -63,12 +74,22 @@ const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;
 const get = async p => (await fetch(p)).json();
 const ts = ms => ms ? new Date(ms).toLocaleString() : '-';
 const short = s => s && s.length > 12 ? s.slice(0,12)+'…' : (s||'-');
+const editor = $('#editor');
+const qs = o => Object.entries(o).map(([k,v])=>`${k}=${encodeURIComponent(v)}`).join('&');
+const api = async (method, path, body) => {
+  const opt = {method};
+  if (body !== undefined) { opt.headers = {'Content-Type':'application/json'}; opt.body = JSON.stringify(body); }
+  const resp = await fetch(path, opt);
+  const text = await resp.text();
+  let data = null; try { data = JSON.parse(text); } catch {}
+  return {status: resp.status, text, data};
+};
 
 function table(cols, rows, onclick) {
   if (!rows || !rows.length) return '<div class="empty">暂无数据</div>';
   let h = '<table><thead><tr>' + cols.map(c=>`<th>${c[0]}</th>`).join('') + '</tr></thead><tbody>';
   rows.forEach((r,i) => {
-    h += `<tr class="${onclick?'click':''}" data-i="${i}">` + cols.map(c=>`<td class="${c[2]||''}">${c[1](r)}</td>`).join('') + '</tr>';
+    h += `<tr class="${onclick?'click':''}" data-i="${i}">` + cols.map(c=>`<td class="${c[2]||''}">${c[1](r, i)}</td>`).join('') + '</tr>';
   });
   h += '</tbody></table>';
   return h;
@@ -88,14 +109,21 @@ async function renderOverview() {
 const renderers = {
   async configs() {
     const rows = await get('/api/configs');
-    view.innerHTML = table([
+    view.innerHTML = '<div class="toolbar"><button id="newCfg">＋ 发布配置</button></div>' + table([
       ['dataId', r=>esc(r.dataId), 'mono'], ['group', r=>esc(r.group)],
       ['tenant', r=>esc(r.tenant)], ['type', r=>esc(r.type||'-')],
       ['md5', r=>esc(short(r.md5)), 'mono'], ['更新时间', r=>ts(r.lastModified), 'mut'],
+      ['操作', (r,i)=>`<button data-act="edit" data-i="${i}">编辑</button> <button data-act="del" data-i="${i}">删除</button>`],
     ], rows, true);
+    $('#newCfg').onclick = () => openConfigForm(null);
+    view.querySelectorAll('[data-act]').forEach(b => b.onclick = e => {
+      e.stopPropagation();
+      const r = rows[+b.dataset.i];
+      if (b.dataset.act === 'edit') openConfigForm(r); else delConfig(r);
+    });
     view.querySelectorAll('tr.click').forEach(tr => tr.onclick = async () => {
       const r = rows[+tr.dataset.i];
-      const d = await get(`/api/config?dataId=${encodeURIComponent(r.dataId)}&group=${encodeURIComponent(r.group)}&tenant=${encodeURIComponent(r.tenant)}`);
+      const d = await get(`/api/config?${qs({dataId:r.dataId, group:r.group, tenant:r.tenant})}`);
       view.insertAdjacentHTML('beforeend',
         `<div class="detail"><h3 class="mono">${esc(r.dataId)} <span class="mut">@ ${esc(r.group)} / ${esc(r.tenant)}</span></h3>
          <pre>${esc(d.content)}</pre></div>`);
@@ -106,18 +134,28 @@ const renderers = {
     view.innerHTML = table([
       ['服务名', r=>esc(r.name), 'mono'], ['group', r=>esc(r.group)],
       ['namespace', r=>esc(r.namespace)], ['实例数', r=>r.instances], ['订阅者', r=>r.subscribers],
+      ['操作', (r,i)=>`<button data-sact="del" data-i="${i}" ${r.instances>0?'disabled title="实例数为 0 才能删除"':''}>删除</button>`],
     ], rows, true);
+    view.querySelectorAll('[data-sact]').forEach(b => b.onclick = e => { e.stopPropagation(); delService(rows[+b.dataset.i]); });
     view.querySelectorAll('tr.click').forEach(tr => tr.onclick = async () => {
       const r = rows[+tr.dataset.i];
-      const d = await get(`/api/service?name=${encodeURIComponent(r.name)}&group=${encodeURIComponent(r.group)}&namespace=${encodeURIComponent(r.namespace)}`);
+      const d = await get(`/api/service?${qs({name:r.name, group:r.group, namespace:r.namespace})}`);
       const hosts = d.serviceInfo.hosts || [];
       let h = `<div class="detail"><h3 class="mono">${esc(r.name)}</h3>`;
       h += table([
         ['IP', x=>esc(x.ip), 'mono'], ['端口', x=>x.port], ['集群', x=>esc(x.clusterName||'-')],
         ['权重', x=>x.weight], ['健康', x=>x.healthy?'✓':'✗'], ['启用', x=>x.enabled?'✓':'✗'],
+        ['操作', x=>`<button data-iact="off" data-ip="${esc(x.ip)}" data-port="${x.port}" data-cluster="${esc(x.clusterName||'DEFAULT')}">下线</button>`],
       ], hosts);
       h += `<p class="mut">订阅者 (${(d.subscribers||[]).length}): <span class="mono">${esc((d.subscribers||[]).join(', ')||'-')}</span></p></div>`;
       view.insertAdjacentHTML('beforeend', h);
+      view.querySelectorAll('[data-iact]').forEach(b => b.onclick = async e => {
+        e.stopPropagation();
+        if (!confirm(`强制下线 ${b.dataset.ip}:${b.dataset.port}？（不断开其连接）`)) return;
+        const res = await api('DELETE', `/api/instance?${qs({name:r.name, group:r.group, namespace:r.namespace, ip:b.dataset.ip, port:b.dataset.port, cluster:b.dataset.cluster})}`);
+        if (res.status !== 200) { alert('下线失败: ' + res.text); return; }
+        render();
+      });
     });
   },
   async connections() {
@@ -137,6 +175,50 @@ const renderers = {
     view.innerHTML = h;
   },
 };
+
+async function openConfigForm(r) {
+  let d = {dataId:'', group:'DEFAULT_GROUP', tenant:'public', type:'', appName:'', content:'', md5:''};
+  if (r) d = {...d, ...r, ...(await get(`/api/config?${qs({dataId:r.dataId, group:r.group, tenant:r.tenant})}`))};
+  const ro = r ? 'readonly' : '';
+  editor.innerHTML = `<div class="form">
+    <h3>${r ? '编辑配置' : '发布配置'}</h3>
+    <div class="grid">
+      <label>dataId <input id="fDataId" value="${esc(d.dataId)}" ${ro}></label>
+      <label>group <input id="fGroup" value="${esc(d.group)}" ${ro}></label>
+      <label>tenant <input id="fTenant" value="${esc(d.tenant)}" ${ro}></label>
+      <label>type <input id="fType" value="${esc(d.type||'')}" placeholder="text / yaml / json"></label>
+      <label>appName <input id="fApp" value="${esc(d.appName||'')}"></label>
+    </div>
+    <label>content <textarea id="fContent" rows="8">${esc(d.content)}</textarea></label>
+    <div class="toolbar"><button id="fSave">发布</button><button id="fCancel">取消</button>
+      ${r ? `<span class="mut">CAS 基准 md5: ${esc(short(d.md5))}</span>` : ''}</div>
+  </div>`;
+  $('#fCancel').onclick = () => editor.innerHTML = '';
+  $('#fSave').onclick = async () => {
+    const body = {dataId:$('#fDataId').value.trim(), group:$('#fGroup').value.trim(), tenant:$('#fTenant').value.trim(),
+      type:$('#fType').value.trim(), appName:$('#fApp').value.trim(), content:$('#fContent').value, expectMd5:r ? d.md5 : ''};
+    if (!body.dataId) { alert('dataId 不能为空'); return; }
+    const res = await api('POST', '/api/config', body);
+    if (res.status === 409) { alert('CAS 冲突：配置已被他人修改，请重新加载后再试'); return; }
+    if (res.status !== 200) { alert('发布失败: ' + res.text); return; }
+    editor.innerHTML = ''; render();
+  };
+}
+
+async function delConfig(r) {
+  if (!confirm(`删除配置 ${r.dataId} @ ${r.group}/${r.tenant}？`)) return;
+  const res = await api('DELETE', `/api/config?${qs({dataId:r.dataId, group:r.group, tenant:r.tenant})}`);
+  if (res.status !== 200) { alert('删除失败: ' + res.text); return; }
+  render();
+}
+
+async function delService(r) {
+  if (!confirm(`删除服务 ${r.name}？（订阅关系保留，新注册仍会推送）`)) return;
+  const res = await api('DELETE', `/api/service?${qs({name:r.name, group:r.group, namespace:r.namespace})}`);
+  if (res.status === 409) { alert('服务仍有实例，不能删除'); return; }
+  if (res.status !== 200) { alert('删除失败: ' + res.text); return; }
+  render();
+}
 
 async function render() {
   try { await renderOverview(); await renderers[tab](); }

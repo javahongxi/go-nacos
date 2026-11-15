@@ -1,17 +1,20 @@
-// Package admin is a read-only observability console: a small HTTP API over
-// the in-process domain services plus an embedded single-page frontend. It is
-// deliberately separate from the gRPC SDK path — no writes, no Nacos 1.x
-// OpenAPI, just inspection of config / naming / connections / raft.
+// Package admin is the observability console: a small HTTP API over the
+// in-process domain services plus an embedded single-page frontend. Reads are
+// GET-only; writes are limited to config publish/delete (through raft) and
+// naming instance-offline / empty-service delete. It is deliberately separate
+// from the gRPC SDK path and does not implement the Nacos 1.x OpenAPI.
 package admin
 
 import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/javahongxi/go-nacos/internal/config"
@@ -33,8 +36,8 @@ type Server struct {
 	lis    net.Listener
 }
 
-// New wires the read-only routes. Every API route is GET-only (the mux returns
-// 405 for anything else); "/" serves the embedded frontend.
+// New wires the routes. Reads are GET-only; the four POST/DELETE routes are
+// the only mutating entry points. "/" serves the embedded frontend.
 func New(cfg *config.Service, naming *naming.Service, conns *conn.Registry, node *raftnode.Node, lis net.Listener, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
@@ -49,6 +52,10 @@ func New(cfg *config.Service, naming *naming.Service, conns *conn.Registry, node
 	mux.HandleFunc("GET /api/service", s.serviceDetail)
 	mux.HandleFunc("GET /api/connections", s.connections)
 	mux.HandleFunc("GET /api/raft", s.raftStatus)
+	mux.HandleFunc("POST /api/config", s.configPublish)
+	mux.HandleFunc("DELETE /api/config", s.configDelete)
+	mux.HandleFunc("DELETE /api/instance", s.instanceDelete)
+	mux.HandleFunc("DELETE /api/service", s.serviceDelete)
 	sub, err := fs.Sub(staticFS, "static")
 	if err != nil {
 		panic(err) // embedded dir is guaranteed by go:embed
@@ -131,6 +138,96 @@ func (s *Server) raftStatus(w http.ResponseWriter, _ *http.Request) {
 		"leader": string(node.Leader()),
 		"stats":  node.Stats(),
 	})
+}
+
+// configPublish creates or updates a config through raft. A non-empty
+// expectMd5 turns it into a CAS publish; a stale md5 loses with 409.
+func (s *Server) configPublish(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		DataID    string `json:"dataId"`
+		Group     string `json:"group"`
+		Tenant    string `json:"tenant"`
+		Content   string `json:"content"`
+		Type      string `json:"type"`
+		AppName   string `json:"appName"`
+		ExpectMD5 string `json:"expectMd5"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, "bad json body", http.StatusBadRequest)
+		return
+	}
+	if in.DataID == "" {
+		http.Error(w, "dataId is required", http.StatusBadRequest)
+		return
+	}
+	k := config.Key{DataID: in.DataID, Group: orDefault(in.Group, "DEFAULT_GROUP"), Tenant: orDefault(in.Tenant, "public")}
+	res := s.cfg.Publish(k, in.Content, in.ExpectMD5, in.Type, in.AppName)
+	if res.Conflict {
+		http.Error(w, res.Message, http.StatusConflict)
+		return
+	}
+	if !res.OK {
+		http.Error(w, res.Message, http.StatusInternalServerError)
+		return
+	}
+	it, _ := s.cfg.Query(k)
+	s.logger.Info("admin: config published", "dataId", k.DataID, "group", k.Group, "cas", in.ExpectMD5 != "")
+	writeJSON(w, map[string]any{"ok": true, "md5": it.MD5})
+}
+
+func (s *Server) configDelete(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	if q.Get("dataId") == "" {
+		http.Error(w, "dataId is required", http.StatusBadRequest)
+		return
+	}
+	k := config.Key{DataID: q.Get("dataId"), Group: orDefault(q.Get("group"), "DEFAULT_GROUP"), Tenant: orDefault(q.Get("tenant"), "public")}
+	res := s.cfg.Remove(k)
+	if !res.OK {
+		http.Error(w, res.Message, http.StatusInternalServerError)
+		return
+	}
+	s.logger.Info("admin: config removed", "dataId", k.DataID, "group", k.Group)
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+// instanceDelete force-offlines an instance without touching its connection.
+func (s *Server) instanceDelete(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	port, err := strconv.Atoi(q.Get("port"))
+	if q.Get("name") == "" || q.Get("ip") == "" || err != nil {
+		http.Error(w, "name, ip and a numeric port are required", http.StatusBadRequest)
+		return
+	}
+	k := naming.Key{Namespace: orDefault(q.Get("namespace"), "public"), Group: orDefault(q.Get("group"), "DEFAULT_GROUP"), Name: q.Get("name")}
+	if !s.naming.AdminDeregister(k, q.Get("ip"), port, q.Get("cluster")) {
+		http.Error(w, "instance not found", http.StatusNotFound)
+		return
+	}
+	s.logger.Info("admin: instance offlined", "service", k.Name, "ip", q.Get("ip"), "port", port)
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+// serviceDelete drops an empty service shell; the subscriber index survives.
+func (s *Server) serviceDelete(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	if q.Get("name") == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	k := naming.Key{Namespace: orDefault(q.Get("namespace"), "public"), Group: orDefault(q.Get("group"), "DEFAULT_GROUP"), Name: q.Get("name")}
+	err := s.naming.DeleteService(k)
+	switch {
+	case errors.Is(err, naming.ErrServiceNotFound):
+		http.Error(w, err.Error(), http.StatusNotFound)
+	case errors.Is(err, naming.ErrServiceNotEmpty):
+		http.Error(w, err.Error(), http.StatusConflict)
+	case err != nil:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	default:
+		s.logger.Info("admin: service deleted", "service", k.Name)
+		writeJSON(w, map[string]any{"ok": true})
+	}
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
