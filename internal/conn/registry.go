@@ -78,10 +78,11 @@ type Registry struct {
 	byID   map[string]*Connection
 	hooks  []func(connID string)
 	logger *slog.Logger
+	nodeID string
 	idSeq  atomic.Int64
 }
 
-func NewRegistry(logger *slog.Logger) *Registry {
+func NewRegistry(nodeID string, logger *slog.Logger) *Registry {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -89,6 +90,7 @@ func NewRegistry(logger *slog.Logger) *Registry {
 		byPeer: map[string]*Connection{},
 		byID:   map[string]*Connection{},
 		logger: logger,
+		nodeID: nodeID,
 	}
 }
 
@@ -104,8 +106,10 @@ func (r *Registry) OnClose(hook func(connID string)) {
 // reconnect on a new source port must not leave the old identity alive.
 func (r *Registry) Register(peer string, meta Meta, send func(*gen.Payload) error) *Connection {
 	c := &Connection{
-		// millis_seq_peer: the seq guards against same-millisecond reconnects.
-		ID:      fmt.Sprintf("%d_%d_%s", time.Now().UnixMilli(), r.idSeq.Add(1), peer),
+		// nodeID_millis_seq_peer: the node prefix makes ids cluster-unique
+		// (sync guards compare them across nodes); the seq guards against
+		// same-millisecond reconnects.
+		ID:      fmt.Sprintf("%s_%d_%d_%s", r.nodeID, time.Now().UnixMilli(), r.idSeq.Add(1), peer),
 		Peer:    peer,
 		Meta:    meta,
 		send:    send,

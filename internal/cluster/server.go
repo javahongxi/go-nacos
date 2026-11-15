@@ -20,20 +20,28 @@ type Applier interface {
 	ApplyForwarded(data []byte) ([]byte, error)
 }
 
+// Syncer is the naming sync manager: apply one inbound sync message and
+// serve full-state snapshot pulls. nil disables naming sync (single-node).
+type Syncer interface {
+	HandleSync(typeName string, data []byte) error
+	Snapshot() ([]byte, error)
+}
+
 // Server hosts the internal Cluster service on its own listener.
 type Server struct {
 	node    *raftnode.Node
 	applier Applier
+	syncer  Syncer
 	grpc    *grpc.Server
 	lis     net.Listener
 	logger  *slog.Logger
 }
 
-func NewServer(node *raftnode.Node, applier Applier, lis net.Listener, logger *slog.Logger) *Server {
+func NewServer(node *raftnode.Node, applier Applier, syncer Syncer, lis net.Listener, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	s := &Server{node: node, applier: applier, lis: lis, logger: logger}
+	s := &Server{node: node, applier: applier, syncer: syncer, lis: lis, logger: logger}
 	s.grpc = grpc.NewServer(grpc.MaxRecvMsgSize(maxMsgSize))
 	s.grpc.RegisterService(&clusterDesc, s)
 	return s
@@ -98,11 +106,58 @@ func (s *Server) handleForward(_ context.Context, p *gen.Payload) (*gen.Payload,
 	return wire.NewPayload(TypeForwardResponse, ForwardResponse{Data: data})
 }
 
+// handleSync applies one naming sync message; the payload type names the
+// message (SyncInstances/RemoveConn/FullMapping/Ping), the body is JSON.
+func (s *Server) handleSync(_ context.Context, p *gen.Payload) (*gen.Payload, error) {
+	if s.syncer == nil {
+		return wire.NewPayload(TypeSyncResponse, SyncResponse{Message: "naming sync unavailable"})
+	}
+	if err := s.syncer.HandleSync(wire.Type(p), p.GetBody().GetValue()); err != nil {
+		return wire.NewPayload(TypeSyncResponse, SyncResponse{Message: err.Error()})
+	}
+	return wire.NewPayload(TypeSyncResponse, SyncResponse{OK: true})
+}
+
+// handleSnapshot serves a full naming state pull.
+func (s *Server) handleSnapshot(_ context.Context, _ *gen.Payload) (*gen.Payload, error) {
+	if s.syncer == nil {
+		return wire.NewPayload(TypeSnapshotResponse, SnapshotResponse{Message: "naming sync unavailable"})
+	}
+	data, err := s.syncer.Snapshot()
+	if err != nil {
+		return wire.NewPayload(TypeSnapshotResponse, SnapshotResponse{Message: err.Error()})
+	}
+	return wire.NewPayload(TypeSnapshotResponse, SnapshotResponse{Data: data})
+}
+
 // clusterAPI is the HandlerType the ServiceDesc checks against — the same
 // hand-written-desc pattern as grpcserver (no protoc-gen-go-grpc).
 type clusterAPI interface {
 	handleJoin(context.Context, *gen.Payload) (*gen.Payload, error)
 	handleForward(context.Context, *gen.Payload) (*gen.Payload, error)
+	handleSync(context.Context, *gen.Payload) (*gen.Payload, error)
+	handleSnapshot(context.Context, *gen.Payload) (*gen.Payload, error)
+}
+
+// unaryMethod builds one MethodDesc; every internal RPC is Payload→Payload.
+func unaryMethod(name string, h func(clusterAPI, context.Context, *gen.Payload) (*gen.Payload, error)) grpc.MethodDesc {
+	full := "/Cluster/" + name
+	return grpc.MethodDesc{
+		MethodName: name,
+		Handler: func(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
+			in := new(gen.Payload)
+			if err := dec(in); err != nil {
+				return nil, err
+			}
+			if interceptor == nil {
+				return h(srv.(clusterAPI), ctx, in)
+			}
+			info := &grpc.UnaryServerInfo{Server: srv, FullMethod: full}
+			return interceptor(ctx, in, info, func(ctx context.Context, req any) (any, error) {
+				return h(srv.(clusterAPI), ctx, req.(*gen.Payload))
+			})
+		},
+	}
 }
 
 var clusterDesc = grpc.ServiceDesc{
@@ -110,37 +165,17 @@ var clusterDesc = grpc.ServiceDesc{
 	HandlerType: (*clusterAPI)(nil),
 	Metadata:    "gonacos_cluster.proto",
 	Methods: []grpc.MethodDesc{
-		{
-			MethodName: "join",
-			Handler: func(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
-				in := new(gen.Payload)
-				if err := dec(in); err != nil {
-					return nil, err
-				}
-				if interceptor == nil {
-					return srv.(clusterAPI).handleJoin(ctx, in)
-				}
-				info := &grpc.UnaryServerInfo{Server: srv, FullMethod: "/Cluster/join"}
-				return interceptor(ctx, in, info, func(ctx context.Context, req any) (any, error) {
-					return srv.(clusterAPI).handleJoin(ctx, req.(*gen.Payload))
-				})
-			},
-		},
-		{
-			MethodName: "forward",
-			Handler: func(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
-				in := new(gen.Payload)
-				if err := dec(in); err != nil {
-					return nil, err
-				}
-				if interceptor == nil {
-					return srv.(clusterAPI).handleForward(ctx, in)
-				}
-				info := &grpc.UnaryServerInfo{Server: srv, FullMethod: "/Cluster/forward"}
-				return interceptor(ctx, in, info, func(ctx context.Context, req any) (any, error) {
-					return srv.(clusterAPI).handleForward(ctx, req.(*gen.Payload))
-				})
-			},
-		},
+		unaryMethod("join", func(a clusterAPI, ctx context.Context, p *gen.Payload) (*gen.Payload, error) {
+			return a.handleJoin(ctx, p)
+		}),
+		unaryMethod("forward", func(a clusterAPI, ctx context.Context, p *gen.Payload) (*gen.Payload, error) {
+			return a.handleForward(ctx, p)
+		}),
+		unaryMethod("sync", func(a clusterAPI, ctx context.Context, p *gen.Payload) (*gen.Payload, error) {
+			return a.handleSync(ctx, p)
+		}),
+		unaryMethod("snapshot", func(a clusterAPI, ctx context.Context, p *gen.Payload) (*gen.Payload, error) {
+			return a.handleSnapshot(ctx, p)
+		}),
 	},
 }

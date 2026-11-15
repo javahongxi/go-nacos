@@ -1,7 +1,8 @@
 // Package naming is the naming domain: ephemeral instances live in memory and
 // their liveness IS the connection (no beat in the gRPC model). Nothing here
-// goes through raft — cluster-wide instance sync is an M2 topic (r-nacos
-// splits the same way: config through raft, ephemeral instances not).
+// goes through raft — cluster-wide sync is connection-level AP (the sync
+// subpackage; r-nacos splits the same way: config through raft, ephemeral
+// instances not).
 //
 // Publisher and subscriber indexes are kept apart, mirroring Java's
 // ClientServiceIndexesManager: the empty-service cleaner drops instance-less
@@ -12,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"sort"
 	"sync"
 	"time"
@@ -22,16 +24,34 @@ import (
 
 // Key identifies one service: namespace + group + name.
 type Key struct {
-	Namespace string
-	Group     string
-	Name      string
+	Namespace string `json:"namespace"`
+	Group     string `json:"group"`
+	Name      string `json:"name"`
 }
 
 func (k Key) String() string { return k.Namespace + "\x00" + k.Group + "\x00" + k.Name }
 
 type instanceEntry struct {
-	inst   wire.Instance
-	connID string
+	inst       wire.Instance
+	connID     string
+	originNode string // node the owning connection lives on
+}
+
+// Entry is one instance with ownership — the unit of cluster sync.
+type Entry struct {
+	Key        Key           `json:"key"`
+	Inst       wire.Instance `json:"inst"`
+	ConnID     string        `json:"connId"`
+	OriginNode string        `json:"originNode"`
+}
+
+// Emitter broadcasts local mutations to peers (implemented by the sync
+// manager). Calls must not block: replication is best-effort and the
+// periodic full mapping heals whatever slips through.
+type Emitter interface {
+	EmitRegister(k Key, inst wire.Instance, connID string)
+	EmitDeregister(k Key, inst wire.Instance, connID string)
+	EmitRemoveConn(connID string)
 }
 
 type serviceState struct {
@@ -50,6 +70,8 @@ type Service struct {
 	subscribers map[string]map[string]bool
 	conns       *conn.Registry
 	logger      *slog.Logger
+	nodeID      string
+	emitter     Emitter
 
 	cleanExpire time.Duration
 	cleanEvery  time.Duration
@@ -72,6 +94,12 @@ func WithCleanerTiming(expire, interval time.Duration) Option {
 			s.cleanEvery = interval
 		}
 	}
+}
+
+// WithNodeID stamps local entries with the owning node — the attribution
+// cluster sync guards and death cleanup key on.
+func WithNodeID(id string) Option {
+	return func(s *Service) { s.nodeID = id }
 }
 
 func NewService(conns *conn.Registry, logger *slog.Logger, opts ...Option) *Service {
@@ -104,6 +132,11 @@ func (s *Service) Close() {
 	})
 }
 
+// SetEmitter installs the cluster broadcast hook. Called once during wiring,
+// before traffic. Remote-apply paths never emit: loop prevention by
+// construction, no from_sync flag needed on the wire.
+func (s *Service) SetEmitter(e Emitter) { s.emitter = e }
+
 func instanceKey(inst wire.Instance) string {
 	return fmt.Sprintf("%s#%d#%s", inst.IP, inst.Port, inst.ClusterName)
 }
@@ -122,9 +155,12 @@ func (s *Service) Register(k Key, inst wire.Instance, connID string) error {
 	}
 	s.mu.Lock()
 	st := s.stateLocked(k)
-	st.instances[instanceKey(inst)] = instanceEntry{inst: inst, connID: connID}
+	st.instances[instanceKey(inst)] = instanceEntry{inst: inst, connID: connID, originNode: s.nodeID}
 	st.lastUpdated = time.Now().UnixMilli()
 	s.mu.Unlock()
+	if s.emitter != nil {
+		s.emitter.EmitRegister(k, inst, connID)
+	}
 	go s.push(k)
 	return nil
 }
@@ -147,6 +183,9 @@ func (s *Service) Deregister(k Key, inst wire.Instance, connID string) {
 	}
 	s.mu.Unlock()
 	if changed {
+		if s.emitter != nil {
+			s.emitter.EmitDeregister(k, inst, connID)
+		}
 		go s.push(k)
 	}
 }
@@ -168,8 +207,10 @@ func (s *Service) AdminDeregister(k Key, ip string, port int, cluster string) bo
 	s.mu.Lock()
 	st := s.services[k.String()]
 	removed := false
+	var owned instanceEntry
 	if st != nil {
-		if _, ok := st.instances[ik]; ok {
+		if e, ok := st.instances[ik]; ok {
+			owned = e
 			delete(st.instances, ik)
 			st.lastUpdated = time.Now().UnixMilli()
 			removed = true
@@ -177,6 +218,12 @@ func (s *Service) AdminDeregister(k Key, ip string, port int, cluster string) bo
 	}
 	s.mu.Unlock()
 	if removed {
+		// Broadcast with the captured owner conn: the connID guard is
+		// cluster-unique, so the override applies on every node — even when
+		// the console sits on a node that only holds a replica.
+		if s.emitter != nil {
+			s.emitter.EmitDeregister(k, owned.inst, owned.connID)
+		}
 		go s.push(k)
 	}
 	return removed
@@ -263,6 +310,9 @@ func (s *Service) removeConn(connID string) {
 		}
 	}
 	s.mu.Unlock()
+	if len(changed) > 0 && s.emitter != nil {
+		s.emitter.EmitRemoveConn(connID)
+	}
 	for _, k := range changed {
 		go s.push(k)
 	}
@@ -421,4 +471,207 @@ func (s *Service) Subscribers(k Key) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// --- cluster sync: remote-apply paths (never emit, so no sync loops) ---
+
+// ApplyRemoteRegister applies a peer's registration. A live local entry wins
+// over a remote claim: a stale broadcast must not steal an endpoint a local
+// connection owns; reconciliation re-converges the loser.
+func (s *Service) ApplyRemoteRegister(from string, k Key, inst wire.Instance, connID string) {
+	if inst.ClusterName == "" {
+		inst.ClusterName = "DEFAULT"
+	}
+	s.mu.Lock()
+	st := s.stateLocked(k)
+	ik := instanceKey(inst)
+	if e, ok := st.instances[ik]; ok {
+		if e.originNode == s.nodeID || (e.connID == connID && e.originNode == from && sameInstance(e.inst, inst)) {
+			s.mu.Unlock()
+			return
+		}
+	}
+	st.instances[ik] = instanceEntry{inst: inst, connID: connID, originNode: from}
+	st.lastUpdated = time.Now().UnixMilli()
+	s.mu.Unlock()
+	go s.push(k)
+}
+
+// ApplyRemoteDeregister guards on connID alone: ids are cluster-unique, so
+// the guard is safe regardless of which node broadcasts (admin offline may
+// originate on a replica holder) and never deletes a newer connection's
+// re-registration of the same endpoint.
+func (s *Service) ApplyRemoteDeregister(_ string, k Key, inst wire.Instance, connID string) {
+	if inst.ClusterName == "" {
+		inst.ClusterName = "DEFAULT"
+	}
+	s.mu.Lock()
+	st := s.services[k.String()]
+	changed := false
+	if st != nil {
+		ik := instanceKey(inst)
+		if e, ok := st.instances[ik]; ok && e.connID == connID {
+			delete(st.instances, ik)
+			st.lastUpdated = time.Now().UnixMilli()
+			changed = true
+		}
+	}
+	s.mu.Unlock()
+	if changed {
+		go s.push(k)
+	}
+}
+
+// ApplyRemoteRemoveConn drops a peer's retired connection: both guards, so a
+// sender can only purge its own connections' entries.
+func (s *Service) ApplyRemoteRemoveConn(from, connID string) {
+	s.mu.Lock()
+	changed := map[string]Key{}
+	now := time.Now().UnixMilli()
+	for ks, st := range s.services {
+		for ik, e := range st.instances {
+			if e.connID == connID && e.originNode == from {
+				delete(st.instances, ik)
+				st.lastUpdated = now
+				changed[ks] = st.key
+			}
+		}
+	}
+	s.mu.Unlock()
+	for _, k := range changed {
+		go s.push(k)
+	}
+}
+
+// Reconcile applies a peer's full connID → instances mapping: delete replicas
+// the peer no longer claims, upsert claimed entries we missed. Only entries
+// with originNode == from are touched, and local takeovers are never
+// overwritten — the two guards that keep reconciliation from eating live
+// state. This heals lost increments in BOTH directions.
+func (s *Service) Reconcile(from string, conns map[string][]Entry) {
+	claimed := map[string]map[string]bool{}
+	for connID, entries := range conns {
+		m := map[string]bool{}
+		for _, e := range entries {
+			m[e.Key.String()+"\x00"+instanceKey(e.Inst)] = true
+		}
+		claimed[connID] = m
+	}
+	s.mu.Lock()
+	changed := map[string]Key{}
+	now := time.Now().UnixMilli()
+	for ks, st := range s.services {
+		for ik, e := range st.instances {
+			if e.originNode != from {
+				continue
+			}
+			if !claimed[e.connID][ks+"\x00"+ik] {
+				delete(st.instances, ik)
+				st.lastUpdated = now
+				changed[ks] = st.key
+			}
+		}
+	}
+	for connID, entries := range conns {
+		for _, e := range entries {
+			inst := e.Inst
+			if inst.ClusterName == "" {
+				inst.ClusterName = "DEFAULT"
+			}
+			st := s.stateLocked(e.Key)
+			ik := instanceKey(inst)
+			if cur, ok := st.instances[ik]; ok {
+				if cur.originNode == s.nodeID || cur.connID != connID {
+					continue // local takeover, or a newer conn owns it
+				}
+				if cur.originNode == from && sameInstance(cur.inst, inst) {
+					continue // unchanged: no push noise every cycle
+				}
+			}
+			st.instances[ik] = instanceEntry{inst: inst, connID: connID, originNode: from}
+			st.lastUpdated = now
+			changed[e.Key.String()] = e.Key
+		}
+	}
+	s.mu.Unlock()
+	for _, k := range changed {
+		go s.push(k)
+	}
+}
+
+// PurgeNode drops every instance owned by a dead node (ping timeout).
+func (s *Service) PurgeNode(from string) {
+	s.mu.Lock()
+	changed := map[string]Key{}
+	now := time.Now().UnixMilli()
+	for ks, st := range s.services {
+		for ik, e := range st.instances {
+			if e.originNode == from {
+				delete(st.instances, ik)
+				st.lastUpdated = now
+				changed[ks] = st.key
+			}
+		}
+	}
+	s.mu.Unlock()
+	for _, k := range changed {
+		go s.push(k)
+	}
+}
+
+// RestoreSnapshot applies a full-state pull, keeping each entry's true
+// origin so death cleanup stays correct on the puller too. Our own entries
+// never come back stale, and local takeovers are never overwritten.
+func (s *Service) RestoreSnapshot(entries []Entry) {
+	s.mu.Lock()
+	changed := map[string]Key{}
+	now := time.Now().UnixMilli()
+	for _, e := range entries {
+		if e.OriginNode == s.nodeID {
+			continue
+		}
+		st := s.stateLocked(e.Key)
+		ik := instanceKey(e.Inst)
+		if cur, ok := st.instances[ik]; ok && (cur.originNode == s.nodeID || cur.connID != e.ConnID) {
+			continue
+		}
+		st.instances[ik] = instanceEntry{inst: e.Inst, connID: e.ConnID, originNode: e.OriginNode}
+		st.lastUpdated = now
+		changed[e.Key.String()] = e.Key
+	}
+	s.mu.Unlock()
+	for _, k := range changed {
+		go s.push(k)
+	}
+}
+
+// AllEntries dumps the full global view (snapshot pulls).
+func (s *Service) AllEntries() []Entry {
+	return s.entries(false)
+}
+
+// LocalEntries dumps only this node's own entries (full-mapping broadcasts).
+func (s *Service) LocalEntries() []Entry {
+	return s.entries(true)
+}
+
+func (s *Service) entries(localOnly bool) []Entry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []Entry
+	for _, st := range s.services {
+		for _, e := range st.instances {
+			if localOnly && e.originNode != s.nodeID {
+				continue
+			}
+			out = append(out, Entry{Key: st.key, Inst: e.inst, ConnID: e.connID, OriginNode: e.originNode})
+		}
+	}
+	return out
+}
+
+func sameInstance(a, b wire.Instance) bool {
+	return a.IP == b.IP && a.Port == b.Port && a.ClusterName == b.ClusterName &&
+		a.Weight == b.Weight && a.Healthy == b.Healthy && a.Enabled == b.Enabled &&
+		a.Ephemeral == b.Ephemeral && a.InstanceID == b.InstanceID && maps.Equal(a.Metadata, b.Metadata)
 }

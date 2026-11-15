@@ -18,6 +18,7 @@ import (
 	"github.com/javahongxi/go-nacos/internal/conn"
 	"github.com/javahongxi/go-nacos/internal/grpcserver"
 	"github.com/javahongxi/go-nacos/internal/naming"
+	nsync "github.com/javahongxi/go-nacos/internal/naming/sync"
 	"github.com/javahongxi/go-nacos/internal/raftnode"
 )
 
@@ -42,6 +43,7 @@ type App struct {
 	GRPC    *grpcserver.Server
 	Admin   *admin.Server
 	Cluster *cluster.Server
+	Sync    *nsync.Manager
 
 	store         *config.Store
 	lis           net.Listener
@@ -104,11 +106,24 @@ func New(opts Options) (*App, error) {
 		syncLis.Close()
 		return nil, err
 	}
-	conns := conn.NewRegistry(opts.Logger)
+	conns := conn.NewRegistry(nodeID, opts.Logger)
 	clusterClient := cluster.NewClient(opts.Logger)
 	cfg := config.NewService(node.Raft, fsm, conns, opts.Logger, clusterClient)
-	namingSvc := naming.NewService(conns, opts.Logger, naming.WithCleanerTiming(opts.NamingCleanExpire, opts.NamingCleanInterval))
-	clusterSrv := cluster.NewServer(node, cfg, syncLis, opts.Logger)
+	namingSvc := naming.NewService(conns, opts.Logger,
+		naming.WithCleanerTiming(opts.NamingCleanExpire, opts.NamingCleanInterval),
+		naming.WithNodeID(nodeID))
+	// The raft member table is the peer list: ServerID IS the sync address.
+	peers := func() []string {
+		servers := node.Voters()
+		out := make([]string, 0, len(servers))
+		for _, srv := range servers {
+			out = append(out, string(srv.ID))
+		}
+		return out
+	}
+	syncMgr := nsync.New(nodeID, namingSvc, clusterClient, peers, opts.Logger)
+	namingSvc.SetEmitter(syncMgr)
+	clusterSrv := cluster.NewServer(node, cfg, syncMgr, syncLis, opts.Logger)
 	srv := grpcserver.New(conns, cfg, namingSvc, opts.Logger)
 
 	lis, err := net.Listen("tcp", opts.GRPCListen)
@@ -132,7 +147,7 @@ func New(opts Options) (*App, error) {
 		adminSrv = admin.New(cfg, namingSvc, conns, node, adminLis, opts.Logger)
 	}
 	return &App{
-		Conns: conns, Config: cfg, Naming: namingSvc, Raft: node, GRPC: srv, Admin: adminSrv, Cluster: clusterSrv,
+		Conns: conns, Config: cfg, Naming: namingSvc, Raft: node, GRPC: srv, Admin: adminSrv, Cluster: clusterSrv, Sync: syncMgr,
 		store: store, lis: lis, syncLis: syncLis, clusterClient: clusterClient, nodeID: nodeID, joinAddr: opts.JoinAddr,
 	}, nil
 }
@@ -168,7 +183,11 @@ func (a *App) Start() error {
 			return err
 		}
 	}
-	return a.Raft.WaitLeader(ctx)
+	if err := a.Raft.WaitLeader(ctx); err != nil {
+		return err
+	}
+	a.Sync.Start()
+	return nil
 }
 
 // join retries against the configured peer, following leader redirects,
@@ -195,17 +214,31 @@ func (a *App) join(ctx context.Context) error {
 }
 
 func (a *App) Stop() {
-	a.stopOnce.Do(func() {
-		a.GRPC.Stop()
-		a.Naming.Close()
-		if a.Admin != nil {
-			a.Admin.Close()
-		}
-		a.Cluster.Stop()
-		_ = a.Raft.Close()
-		_ = a.store.Close()
-		a.clusterClient.Close()
-	})
+	a.stopOnce.Do(func() { a.shutdown(false) })
+}
+
+// HardStop simulates a process crash for e2e: no connection retirement, no
+// goodbye broadcasts — peers must detect the death via the ping timeout.
+func (a *App) HardStop() {
+	a.stopOnce.Do(func() { a.shutdown(true) })
+}
+
+func (a *App) shutdown(hard bool) {
+	if hard {
+		a.Sync.Stop() // silence first: the crash must not broadcast
+		a.GRPC.HardStop()
+	} else {
+		a.GRPC.Stop() // retire conns while sync still runs: peers get the deletes
+		a.Sync.Stop()
+	}
+	a.Naming.Close()
+	if a.Admin != nil {
+		a.Admin.Close()
+	}
+	a.Cluster.Stop()
+	_ = a.Raft.Close()
+	_ = a.store.Close()
+	a.clusterClient.Close()
 }
 
 // DropConnections forces every client to reconnect; e2e replay tests use it.

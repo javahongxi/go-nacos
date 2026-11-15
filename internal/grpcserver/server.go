@@ -56,6 +56,11 @@ func (s *Server) Stop() {
 	s.grpc.GracefulStop()
 }
 
+// HardStop aborts without retiring connections or waiting for streams — the
+// e2e crash simulation: peers must notice the death through their own ping
+// timeout, not through goodbye broadcasts.
+func (s *Server) HardStop() { s.grpc.Stop() }
+
 // DropConnections retires every live connection without stopping the server;
 // the e2e reconnect tests use it to force sweet's replay path.
 func (s *Server) DropConnections() { s.conns.CloseAll() }

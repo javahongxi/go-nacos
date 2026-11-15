@@ -24,10 +24,13 @@ const maxMsgSize = 32 << 20
 
 // Metadata.type values for the internal protocol (not Nacos SDK types).
 const (
-	TypeJoinRequest     = "JoinRequest"
-	TypeJoinResponse    = "JoinResponse"
-	TypeForwardRequest  = "ForwardRequest"
-	TypeForwardResponse = "ForwardResponse"
+	TypeJoinRequest      = "JoinRequest"
+	TypeJoinResponse     = "JoinResponse"
+	TypeForwardRequest   = "ForwardRequest"
+	TypeForwardResponse  = "ForwardResponse"
+	TypeSyncResponse     = "SyncResponse"
+	TypeSnapshotRequest  = "SnapshotRequest"
+	TypeSnapshotResponse = "SnapshotResponse"
 )
 
 // JoinRequest asks the cluster to add the caller as a voter. NodeID is the
@@ -53,6 +56,21 @@ type ForwardRequest struct {
 // ForwardResponse carries the leader's apply result bytes, or a Message on
 // refusal (e.g. the peer lost leadership mid-flight).
 type ForwardResponse struct {
+	Data    []byte `json:"data,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+// SyncResponse acknowledges one naming sync message.
+type SyncResponse struct {
+	OK      bool   `json:"ok"`
+	Message string `json:"message,omitempty"`
+}
+
+// SnapshotRequest asks a peer for its full naming state.
+type SnapshotRequest struct{}
+
+// SnapshotResponse carries the state as domain-owned JSON bytes.
+type SnapshotResponse struct {
 	Data    []byte `json:"data,omitempty"`
 	Message string `json:"message,omitempty"`
 }
@@ -115,6 +133,31 @@ func (c *Client) Join(ctx context.Context, addr string, req JoinRequest) (JoinRe
 func (c *Client) Forward(ctx context.Context, addr string, data []byte) ([]byte, error) {
 	var resp ForwardResponse
 	if err := c.invoke(ctx, addr, "/Cluster/forward", TypeForwardRequest, ForwardRequest{Data: data}, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Message != "" {
+		return nil, errors.New(resp.Message)
+	}
+	return resp.Data, nil
+}
+
+// Send delivers one naming sync message: typeName (SyncInstances/RemoveConn/
+// FullMapping/Ping) travels in Metadata.type, the JSON body is domain-owned.
+func (c *Client) Send(ctx context.Context, addr, typeName string, body any) error {
+	var resp SyncResponse
+	if err := c.invoke(ctx, addr, "/Cluster/sync", typeName, body, &resp); err != nil {
+		return err
+	}
+	if !resp.OK {
+		return errors.New(resp.Message)
+	}
+	return nil
+}
+
+// PullSnapshot fetches a peer's full naming state (join/restart catch-up).
+func (c *Client) PullSnapshot(ctx context.Context, addr string) ([]byte, error) {
+	var resp SnapshotResponse
+	if err := c.invoke(ctx, addr, "/Cluster/snapshot", TypeSnapshotRequest, SnapshotRequest{}, &resp); err != nil {
 		return nil, err
 	}
 	if resp.Message != "" {
