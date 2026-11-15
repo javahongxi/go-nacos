@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/javahongxi/go-nacos/internal/cluster"
 	"github.com/javahongxi/go-nacos/internal/config"
 	"github.com/javahongxi/go-nacos/internal/conn"
 	"github.com/javahongxi/go-nacos/internal/naming"
@@ -27,22 +28,23 @@ import (
 var staticFS embed.FS
 
 type Server struct {
-	cfg    *config.Service
-	naming *naming.Service
-	conns  *conn.Registry
-	raft   *raftnode.Node
-	logger *slog.Logger
-	http   *http.Server
-	lis    net.Listener
+	cfg     *config.Service
+	naming  *naming.Service
+	conns   *conn.Registry
+	raft    *raftnode.Node
+	cluster *cluster.Client
+	logger  *slog.Logger
+	http    *http.Server
+	lis     net.Listener
 }
 
-// New wires the routes. Reads are GET-only; the four POST/DELETE routes are
-// the only mutating entry points. "/" serves the embedded frontend.
-func New(cfg *config.Service, naming *naming.Service, conns *conn.Registry, node *raftnode.Node, lis net.Listener, logger *slog.Logger) *Server {
+// New wires the routes. Reads are GET-only; the POST/DELETE routes are the
+// only mutating entry points. "/" serves the embedded frontend.
+func New(cfg *config.Service, naming *naming.Service, conns *conn.Registry, node *raftnode.Node, clusterClient *cluster.Client, lis net.Listener, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	s := &Server{cfg: cfg, naming: naming, conns: conns, raft: node, logger: logger, lis: lis}
+	s := &Server{cfg: cfg, naming: naming, conns: conns, raft: node, cluster: clusterClient, logger: logger, lis: lis}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/overview", s.overview)
@@ -56,6 +58,7 @@ func New(cfg *config.Service, naming *naming.Service, conns *conn.Registry, node
 	mux.HandleFunc("DELETE /api/config", s.configDelete)
 	mux.HandleFunc("DELETE /api/instance", s.instanceDelete)
 	mux.HandleFunc("DELETE /api/service", s.serviceDelete)
+	mux.HandleFunc("DELETE /api/raft/member", s.raftMemberDelete)
 	sub, err := fs.Sub(staticFS, "static")
 	if err != nil {
 		panic(err) // embedded dir is guaranteed by go:embed
@@ -240,6 +243,50 @@ func (s *Server) serviceDelete(w http.ResponseWriter, r *http.Request) {
 	default:
 		s.logger.Info("admin: service deleted", "service", k.Name)
 		writeJSON(w, map[string]any{"ok": true})
+	}
+}
+
+// raftMemberDelete removes a voter through the leader, following redirects
+// from any node. The removed node self-stops; its naming replicas are swept
+// by the member-table diff on every survivor.
+func (s *Server) raftMemberDelete(w http.ResponseWriter, r *http.Request) {
+	node := r.URL.Query().Get("node")
+	if node == "" {
+		http.Error(w, "node is required", http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	addr := s.raft.NodeID() // leader executes locally; a follower redirects
+	var lastMsg string
+	for {
+		resp, err := s.cluster.Remove(ctx, addr, cluster.RemoveRequest{NodeID: node})
+		switch {
+		case err == nil && resp.OK:
+			s.logger.Info("admin: voter removed", "node", node)
+			writeJSON(w, map[string]any{"ok": true})
+			return
+		case err != nil:
+			lastMsg = err.Error()
+		default:
+			lastMsg = resp.Message
+			if resp.LeaderID != "" {
+				addr = resp.LeaderID
+			}
+		}
+		if lastMsg == "cannot remove the last voter" {
+			http.Error(w, lastMsg, http.StatusConflict)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			if lastMsg == "" {
+				lastMsg = "remove timed out"
+			}
+			http.Error(w, lastMsg, http.StatusInternalServerError)
+			return
+		case <-time.After(200 * time.Millisecond):
+		}
 	}
 }
 

@@ -49,7 +49,9 @@ type App struct {
 	clusterClient *cluster.Client
 	nodeID        string
 	joinAddr      string
+	logger        *slog.Logger
 	stopOnce      sync.Once
+	done          chan struct{}
 }
 
 func New(opts Options) (*App, error) {
@@ -133,11 +135,12 @@ func New(opts Options) (*App, error) {
 			clusterClient.Close()
 			return nil, fmt.Errorf("app: admin listen %s: %w", opts.AdminListen, err)
 		}
-		adminSrv = admin.New(cfg, namingSvc, conns, node, adminLis, opts.Logger)
+		adminSrv = admin.New(cfg, namingSvc, conns, node, clusterClient, adminLis, opts.Logger)
 	}
 	return &App{
 		Conns: conns, Config: cfg, Naming: namingSvc, Raft: node, GRPC: srv, Admin: adminSrv, Cluster: clusterSrv, Sync: syncMgr,
 		store: store, lis: lis, clusterClient: clusterClient, nodeID: nodeID, joinAddr: opts.JoinAddr,
+		logger: opts.Logger, done: make(chan struct{}),
 	}, nil
 }
 
@@ -152,6 +155,10 @@ func (a *App) AdminAddr() string {
 	}
 	return a.Admin.Addr()
 }
+
+// Done is closed once the app has shut down — including a self-stop after
+// being removed from the raft cluster.
+func (a *App) Done() <-chan struct{} { return a.done }
 
 // Start serves in the background, joins the cluster when configured, and
 // waits until raft has a leader, so a caller can publish immediately after
@@ -172,7 +179,41 @@ func (a *App) Start() error {
 		return err
 	}
 	a.Sync.Start()
+	go a.watchMembership()
 	return nil
+}
+
+// watchMembership self-stops a node that has been removed from the raft
+// configuration. Armed only after Start succeeds (join + leader wait), so a
+// fresh joiner's empty pre-join configuration never triggers it. Removal is
+// committed cluster-wide, so the configuration is stable even mid-election;
+// an unreadable (empty) configuration never self-stops.
+func (a *App) watchMembership() {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-a.done:
+			return
+		case <-t.C:
+			voters := a.Raft.Voters()
+			if len(voters) == 0 {
+				continue
+			}
+			member := false
+			for _, srv := range voters {
+				if string(srv.ID) == a.nodeID {
+					member = true
+					break
+				}
+			}
+			if !member {
+				a.logger.Warn("app: removed from cluster, shutting down", "node", a.nodeID)
+				a.Stop()
+				return
+			}
+		}
+	}
 }
 
 // join retries against the configured peer, following leader redirects,
@@ -223,6 +264,7 @@ func (a *App) shutdown(hard bool) {
 	_ = a.Raft.Close()
 	_ = a.store.Close()
 	a.clusterClient.Close()
+	close(a.done)
 }
 
 // DropConnections forces every client to reconnect; e2e replay tests use it.

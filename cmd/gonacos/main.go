@@ -36,7 +36,10 @@ func main() {
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
+	select {
+	case <-sig:
+	case <-a.Done(): // removed from the cluster: the watcher already self-stopped
+	}
 	logger.Info("shutting down")
 	a.Stop()
 }

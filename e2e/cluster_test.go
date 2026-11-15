@@ -2,6 +2,8 @@ package e2e
 
 import (
 	"context"
+	"net/http"
+	"slices"
 	"testing"
 	"time"
 
@@ -314,4 +316,207 @@ func TestClusterReconcile(t *testing.T) {
 		t.Fatalf("dropped deregister leaked through: %+v err=%v", info, err)
 	}
 	waitHostsWithin(t, consumer.Updates(), 0, 15*time.Second)
+}
+
+// raftMembers reads a node's current member table from its console.
+func raftMembers(t *testing.T, a *app.App) []string {
+	t.Helper()
+	var rs struct {
+		Members []struct {
+			ID string `json:"id"`
+		} `json:"members"`
+	}
+	adminGet(t, "http://"+a.AdminAddr()+"/api/raft", &rs)
+	ids := make([]string, 0, len(rs.Members))
+	for _, m := range rs.Members {
+		ids = append(ids, m.ID)
+	}
+	return ids
+}
+
+// waitMembers polls until the member table equals want (order-independent).
+func waitMembers(t *testing.T, a *app.App, want ...string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := raftMembers(t, a)
+		if len(got) == len(want) {
+			match := true
+			for _, w := range want {
+				if !slices.Contains(got, w) {
+					match = false
+				}
+			}
+			if match {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("member table on %s = %v, want %v", a.Addr(), got, want)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// waitDone waits for a removed node to self-stop (the membership watcher).
+func waitDone(t *testing.T, a *app.App, d time.Duration) {
+	t.Helper()
+	select {
+	case <-a.Done():
+	case <-time.After(d):
+		t.Fatalf("node %s did not self-stop after removal", a.Addr())
+	}
+}
+
+// TestClusterRemoveFollower locks the scale-down path: removing a follower
+// shrinks every member table, sweeps its naming replicas on the survivors,
+// self-stops the victim, and leaves config writes working at quorum 2/2.
+func TestClusterRemoveFollower(t *testing.T) {
+	a1 := newClusterApp(t, t.TempDir(), "")
+	a2 := newClusterApp(t, t.TempDir(), a1.Addr())
+	a3 := newClusterApp(t, t.TempDir(), a1.Addr())
+	victim := a3.Addr()
+	provider := newNaming(t, a3.Addr())
+	consumer := newNaming(t, a2.Addr())
+	cfg1 := newConfig(t, a1.Addr())
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const svc = "cluster.Remove"
+	inst := nacos.Instance{IP: "127.0.0.1", Port: 24040, Weight: 1, Healthy: true, Enabled: true, Ephemeral: true}
+	if err := provider.Register(ctx, svc, inst); err != nil {
+		t.Fatalf("register on a3: %v", err)
+	}
+	waitQueryHosts(t, ctx, consumer, svc, 1)
+	if _, err := consumer.Subscribe(ctx, svc); err != nil {
+		t.Fatalf("subscribe on a2: %v", err)
+	}
+
+	// Remove a3 through the leader's console.
+	adminWrite(t, http.MethodDelete, "http://"+a1.AdminAddr()+"/api/raft/member?node="+victim, nil, http.StatusOK)
+
+	// a3 self-stops; survivors shrink their tables and sweep its replicas.
+	waitDone(t, a3, 10*time.Second)
+	waitHostsWithin(t, consumer.Updates(), 0, 10*time.Second)
+	waitQueryHosts(t, ctx, consumer, svc, 0)
+	waitMembers(t, a1, a1.Addr(), a2.Addr())
+	waitMembers(t, a2, a1.Addr(), a2.Addr())
+
+	// Config still writes with quorum 2/2.
+	key := nacos.ConfigKey{DataID: "after-remove.yaml", Group: "DEFAULT_GROUP"}
+	if err := cfg1.Publish(ctx, key, nacos.PublishInput{Content: "ok"}); err != nil {
+		t.Fatalf("publish after removal: %v", err)
+	}
+	got, err := cfg1.Query(ctx, key)
+	if err != nil || got.Content != "ok" {
+		t.Fatalf("query after removal: %+v err=%v", got, err)
+	}
+}
+
+// TestClusterRemoveRedirect locks leader routing: a remove issued on a
+// follower's console is redirected to the leader and takes effect.
+func TestClusterRemoveRedirect(t *testing.T) {
+	a1 := newClusterApp(t, t.TempDir(), "")
+	a2 := newClusterApp(t, t.TempDir(), a1.Addr())
+	a3 := newClusterApp(t, t.TempDir(), a1.Addr())
+	victim := a3.Addr()
+	adminWrite(t, http.MethodDelete, "http://"+a2.AdminAddr()+"/api/raft/member?node="+victim, nil, http.StatusOK)
+	waitDone(t, a3, 10*time.Second)
+	waitMembers(t, a1, a1.Addr(), a2.Addr())
+}
+
+// TestClusterRemoveLeader locks leader self-removal: the remaining two elect
+// a new leader, writes recover, replicated data survives, and the old leader
+// self-stops.
+func TestClusterRemoveLeader(t *testing.T) {
+	a1 := newClusterApp(t, t.TempDir(), "")
+	a2 := newClusterApp(t, t.TempDir(), a1.Addr())
+	a3 := newClusterApp(t, t.TempDir(), a1.Addr())
+	leader := a1.Addr()
+	cfg2 := newConfig(t, a2.Addr())
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	key := nacos.ConfigKey{DataID: "leader-remove.yaml", Group: "DEFAULT_GROUP"}
+	if err := cfg2.Publish(ctx, key, nacos.PublishInput{Content: "before"}); err != nil {
+		t.Fatalf("publish before removal: %v", err)
+	}
+
+	// Remove the leader through its own console.
+	adminWrite(t, http.MethodDelete, "http://"+a1.AdminAddr()+"/api/raft/member?node="+leader, nil, http.StatusOK)
+	waitDone(t, a1, 10*time.Second)
+
+	// The remaining two elect a new leader; writes recover and data survives.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		err := cfg2.Publish(ctx, key, nacos.PublishInput{Content: "after"})
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("write never recovered after leader removal: %v", err)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	// a2 may still be a follower: its FSM trails the leader, so poll the read
+	// until it converges (the same async-apply semantics as forwarding).
+	qdeadline := time.Now().Add(5 * time.Second)
+	for {
+		got, err := cfg2.Query(ctx, key)
+		if err == nil && got.Content == "after" {
+			break
+		}
+		if time.Now().After(qdeadline) {
+			t.Fatalf("query after leader removal: %+v err=%v", got, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	waitMembers(t, a2, a2.Addr(), a3.Addr())
+	waitMembers(t, a3, a2.Addr(), a3.Addr())
+}
+
+// TestClusterRemoveGuards locks the refusal rails: the last voter cannot be
+// removed, an unknown node is idempotent OK, and a missing param is a 400.
+func TestClusterRemoveGuards(t *testing.T) {
+	a1 := newClusterApp(t, t.TempDir(), "")
+	base := "http://" + a1.AdminAddr()
+	adminWrite(t, http.MethodDelete, base+"/api/raft/member?node="+a1.Addr(), nil, http.StatusConflict)
+	adminWrite(t, http.MethodDelete, base+"/api/raft/member?node=127.0.0.1:1", nil, http.StatusOK)
+	adminWrite(t, http.MethodDelete, base+"/api/raft/member", nil, http.StatusBadRequest)
+	waitMembers(t, a1, a1.Addr())
+}
+
+// TestClusterRemovedRejoin locks the re-add path: a removed node restarted
+// with the same identity and data dir re-joins idempotently and refills its
+// naming state from a peer snapshot.
+func TestClusterRemovedRejoin(t *testing.T) {
+	a1 := newClusterApp(t, t.TempDir(), "")
+	provider1 := newNaming(t, a1.Addr())
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const svc = "cluster.Rejoin"
+	inst1 := nacos.Instance{IP: "127.0.0.1", Port: 24050, Weight: 1, Healthy: true, Enabled: true, Ephemeral: true}
+	if err := provider1.Register(ctx, svc, inst1); err != nil {
+		t.Fatalf("register on a1: %v", err)
+	}
+
+	// a2 joins on a pinned identity so a restart keeps it.
+	grpcAddr := pinnedGRPCListen(t)
+	dir := t.TempDir()
+	joinPin := func(o *app.Options) { o.GRPCListen = grpcAddr; o.JoinAddr = a1.Addr() }
+	a2 := newApp(t, dir, joinPin)
+	consumer2 := newNaming(t, a2.Addr())
+	waitQueryHosts(t, ctx, consumer2, svc, 1) // snapshot pull filled it
+
+	// Remove a2; it self-stops.
+	adminWrite(t, http.MethodDelete, "http://"+a1.AdminAddr()+"/api/raft/member?node="+grpcAddr, nil, http.StatusOK)
+	waitDone(t, a2, 10*time.Second)
+	waitMembers(t, a1, a1.Addr())
+
+	// Restart with the same identity and data dir, re-joining explicitly.
+	a2b := newApp(t, dir, joinPin)
+	consumer2b := newNaming(t, a2b.Addr())
+	waitQueryHosts(t, ctx, consumer2b, svc, 1)
+	waitMembers(t, a1, a1.Addr(), grpcAddr)
 }

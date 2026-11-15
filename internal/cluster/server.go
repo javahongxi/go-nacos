@@ -80,6 +80,44 @@ func (s *Server) handleJoin(_ context.Context, p *gen.Payload) (*gen.Payload, er
 	return wire.NewPayload(TypeJoinResponse, JoinResponse{OK: true})
 }
 
+// handleRemove drops a voter (scale-down). Like join, only the leader mutates
+// membership and followers redirect; removing an absent node is idempotent.
+// The last voter is refused: an empty configuration can never elect again.
+func (s *Server) handleRemove(_ context.Context, p *gen.Payload) (*gen.Payload, error) {
+	var req RemoveRequest
+	if err := wire.Decode(p, &req); err != nil {
+		return nil, err
+	}
+	if req.NodeID == "" {
+		return wire.NewPayload(TypeRemoveResponse, RemoveResponse{Message: "nodeId is required"})
+	}
+	r := s.node.Raft
+	if r.State() != raft.Leader {
+		_, leaderID := r.LeaderWithID()
+		return wire.NewPayload(TypeRemoveResponse, RemoveResponse{LeaderID: string(leaderID), Message: "not leader"})
+	}
+	voters := s.node.Voters()
+	found := false
+	for _, srv := range voters {
+		if string(srv.ID) == req.NodeID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return wire.NewPayload(TypeRemoveResponse, RemoveResponse{OK: true}) // already absent
+	}
+	if len(voters) <= 1 {
+		return wire.NewPayload(TypeRemoveResponse, RemoveResponse{Message: "cannot remove the last voter"})
+	}
+	f := r.RemoveServer(raft.ServerID(req.NodeID), 0, 10*time.Second)
+	if err := f.Error(); err != nil {
+		return wire.NewPayload(TypeRemoveResponse, RemoveResponse{Message: err.Error()})
+	}
+	s.logger.Info("cluster: voter removed", "node", req.NodeID)
+	return wire.NewPayload(TypeRemoveResponse, RemoveResponse{OK: true})
+}
+
 // handleForward applies a follower's write on the leader. The original
 // command bytes are applied as-is (the origin already stamped Now), and the
 // FSM change hook notifies listeners on every node — no extra fan-out.
@@ -127,6 +165,7 @@ func (s *Server) handleSnapshot(_ context.Context, _ *gen.Payload) (*gen.Payload
 // hand-written-desc pattern as grpcserver (no protoc-gen-go-grpc).
 type clusterAPI interface {
 	handleJoin(context.Context, *gen.Payload) (*gen.Payload, error)
+	handleRemove(context.Context, *gen.Payload) (*gen.Payload, error)
 	handleForward(context.Context, *gen.Payload) (*gen.Payload, error)
 	handleSync(context.Context, *gen.Payload) (*gen.Payload, error)
 	handleSnapshot(context.Context, *gen.Payload) (*gen.Payload, error)
@@ -160,6 +199,9 @@ var clusterDesc = grpc.ServiceDesc{
 	Methods: []grpc.MethodDesc{
 		unaryMethod("join", func(a clusterAPI, ctx context.Context, p *gen.Payload) (*gen.Payload, error) {
 			return a.handleJoin(ctx, p)
+		}),
+		unaryMethod("remove", func(a clusterAPI, ctx context.Context, p *gen.Payload) (*gen.Payload, error) {
+			return a.handleRemove(ctx, p)
 		}),
 		unaryMethod("forward", func(a clusterAPI, ctx context.Context, p *gen.Payload) (*gen.Payload, error) {
 			return a.handleForward(ctx, p)

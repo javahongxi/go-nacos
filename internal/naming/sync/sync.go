@@ -258,8 +258,26 @@ func (m *Manager) pingLoop() {
 				go m.ping(addr)
 			}
 			m.mu.Unlock()
+			m.sweepAbsent()
 		}
 	}
+}
+
+// sweepAbsent purges replicas of nodes that left the raft member table.
+// Membership-driven, not event-driven: a committed removal converges on
+// every node within one tick without any new message. A crashed node stays
+// a voter, so the independent ping death path keeps its job; an unreadable
+// configuration (empty) never purges.
+func (m *Manager) sweepAbsent() {
+	peers := m.peers()
+	if len(peers) == 0 {
+		return
+	}
+	keep := make(map[string]bool, len(peers))
+	for _, addr := range peers {
+		keep[addr] = true // self included: local entries are exempt
+	}
+	m.svc.PurgeAbsentNodes(keep)
 }
 
 func (m *Manager) ping(addr string) {

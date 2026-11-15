@@ -46,7 +46,7 @@ graph TD
     NS -->|五种 JSON 消息| CL[cluster 内部 gRPC 服务]
     CFG -->|非 leader 转发| CL
     CL ---|注册于 SDK gRPC server，同端口| U
-    CL <-->|join/forward/sync/snapshot| P[对端节点]
+    CL <-->|join/remove/forward/sync/snapshot| P[对端节点]
     RAFT -->|成员表 = peer 列表| NS
     B[浏览器] -->|HTTP 读+有限写| ADM[internal/admin]
     ADM --> CFG
@@ -63,10 +63,10 @@ graph TD
 | `internal/config` | bbolt 存储、raft FSM（CAS 在 Apply 内、OnChange 钩子）、listen/notify 服务、非 leader 写转发 |
 | `internal/naming` | 内存实例表（entry 带 originNode 归属）+ 独立订阅索引 + 空服务清理器，连接即活性；远端 apply 路径永不 emit |
 | `internal/naming/sync` | 临时实例跨节点 AP 同步：增量广播、12s 全量对账、3s ping/15s 判死、snapshot 拉取 |
-| `internal/cluster` | 内部节点间 gRPC 服务（注册在 SDK gRPC server 上，同端口）：join/forward/sync/snapshot，Payload 信封 + JSON body |
+| `internal/cluster` | 内部节点间 gRPC 服务（注册在 SDK gRPC server 上，同端口）：join/remove/forward/sync/snapshot，Payload 信封 + JSON body |
 | `internal/raftnode` | hashicorp/raft 组装：bolt log+stable、file snapshot、TCP transport、bootstrap/join、成员表访问器 |
 | `internal/grpcserver` | 两个 ServiceDesc、unary 分发、bidi 流生命周期 |
-| `internal/admin` | 观测台：独立 HTTP 端口 + embed 单页前端；读 GET-only，写限配置发布/删除 + 命名下线/删空服务 |
+| `internal/admin` | 观测台：独立 HTTP 端口 + embed 单页前端；读 GET-only，写限配置发布/删除 + 命名下线/删空服务 + raft 节点移除 |
 | `internal/app` | 组装 + 生命周期（cmd 与 e2e 共用） |
 | `e2e` | sweet 客户端驱动的端到端测试 |
 
@@ -81,13 +81,14 @@ graph TD
 7. **connectionId 加节点前缀与原子序号**：`nodeID_millis_seq_peer`，集群唯一且防同毫秒重连碰撞；deregister 仅 connID 守卫即可跨节点安全（admin 强制下线可在副本持有节点发起）。
 8. **旧流清理带 ID 比对**：重连竞态下旧流的 Unregister 不会误清新连接。
 9. **信封类型复用 sweet/gen，不另 vendored**：protobuf 全局注册表按 proto 文件名去重，服务端与客户端各持一份同名 `nacos_grpc_service.proto` 会在 e2e 二进制 init 时 panic（"file already registered"）。共享同一生成包既消除冲突，又让服务端/客户端线级孪生由构造保证。代价是服务端依赖 sweet 模块（仅 gen 包，纯 protobuf 类型）。
-10. **观测台与 SDK 路径隔离**：Java/r-nacos 控制台各吃一套私有 HTTP 管理契约，与 gRPC-only 服务端错配，故自建。`internal/admin` 独立端口（默认 127.0.0.1:8080，对齐 Nacos 3.x 控制台端口，`off` 禁用）、embed 前端零外部依赖；读 GET-only，写仅四条路由：配置发布/删除（走 raft，编辑带 CAS、冲突 409）与命名强制下线/删空服务（不断连接、保留订阅索引）；暂不鉴权（M3 议题），默认仅回环监听。gRPC handler 零改动。
+10. **观测台与 SDK 路径隔离**：Java/r-nacos 控制台各吃一套私有 HTTP 管理契约，与 gRPC-only 服务端错配，故自建。`internal/admin` 独立端口（默认 127.0.0.1:8080，对齐 Nacos 3.x 控制台端口，`off` 禁用）、embed 前端零外部依赖；读 GET-only，写仅五条路由：配置发布/删除（走 raft，编辑带 CAS、冲突 409）、命名强制下线/删空服务（不断连接、保留订阅索引）与 raft 节点移除（leader 路由、末位 voter 拒绝 409）；暂不鉴权（M3 议题），默认仅回环监听。gRPC handler 零改动。
 11. **空服务清理严格对齐 Java**：订阅索引提升到 Service 顶层独立保存（对应 `ClientServiceIndexesManager` 的 publisherIndexes/subscriberIndexes 分离）；清理器 60s 周期扫描，只删无实例且最后实例变更超 60s 的服务壳（`EmptyServiceAutoCleanerV2`），不动订阅索引——清壳后新注册仍推到旧订阅者，客户端无需重连。壳上 `lastUpdated` 只在实例变更时刷新（Java：`ServiceChangedEvent` → `Service.renewUpdateTime`，订阅不刷新）。
 12. **节点身份 = gRPC 地址**：raft ServerID = gRPC 绑定地址（raft Address 仍是 raft 传输地址），raft 配置表天然即成员表——Join 重定向与 naming peer 拨号零发现协议。代价：固定端口即稳定身份，重启须保持 gRPC 端口不变（生产语义；旧 data/ 目录在身份语义变更前需重建）。
 13. **防回环靠结构性隔离**：远端 apply 路径（ApplyRemote*/Reconcile/PurgeNode/RestoreSnapshot）永不 emit，无需 from_sync 标志；订阅索引仅本地，远端变更只触发常规本地推送。对账双守卫：只动 originNode=对端 的条目且 connID 匹配，本地 takeover 永不被远端声明覆盖。
 14. **FSM OnChange 钩子**：每节点 Apply 变更后各推本地监听者，3+ 节点 config watch 不漏、零额外 RPC；钩子在释放 FSM 锁后调用，防与 Listen 的锁序倒置。follower 读/订阅种子经 AppendEntries 异步追赶，属正常 raft 语义。
 15. **内部传输复用 SDK gRPC 端口**：hashicorp/raft 的 transport 只做共识（r-nacos 自带 raft 网络层可复用，我们不能），join/forward/naming 同步是注册在 SDK gRPC server 上的独立 Cluster 服务（同端口 9848、不同 service，Java Nacos 的 server gRPC 同样多路复用），手写 ServiceDesc、复用 sweet/gen.Payload 信封 + JSON body；不另开端口，SDK 协议零改动。
 16. **端口对齐 Java Nacos**：以主端口 8848 为基准的官方偏移——gRPC +1000=9848（SDK 与节点间内部 RPC 复用）、raft -1000=7848；控制台 8080（Nacos 3.x 独立控制台端口，不偏移）。Java 的 +1001=9849 服务端 gRPC 端口在 go-nacos 里不需要（内部 RPC 已并入 9848）；go-nacos 无 1.x HTTP OpenAPI，故不监听 8848 本身。
+17. **节点移除（缩容）**：内部 `/Cluster/remove` 仅 leader 执行、follower 回 LeaderID 重定向、目标缺席幂等 OK、末位 voter 拒绝（配置清空即永久死亡）；admin `DELETE /api/raft/member` 是唯一入口（不做 `-leave`，重启语义优先）。naming 副本清理走**成员差集 sweep**：pingLoop 每 tick 删除 originNode 不在 voter 表的条目（`PurgeAbsentNodes`），成员表驱动而非事件广播——自愈、零新消息，与“对账兜底”一致；崩溃节点仍是 voter 故不触发，独立 ping 判死职责不变（失多数派不误清）。被移除节点 `watchMembership`（Start 成功后武装，1s tick）检测自身不在配置表即优雅 Stop 自动停服；离线重启的旧身份节点同样据此拒绝服务。
 
 ## 里程碑
 
@@ -97,6 +98,7 @@ graph TD
 - **控制台写（已完成）**：配置发布/编辑（CAS）/删除、实例强制下线、删空服务；写走与 SDK 同一领域路径（e2e 验证 admin 写→SDK 查询/监听可见）；前端表单与操作按钮。
 - **M2a（已完成）**：raft 组集群——首节点 BootstrapCluster、其余 Join（非 leader 重定向）、config 写 leader 路由/转发、FSM 变更钩子全节点推本地监听者、成员表暴露；e2e 锁定 follower 转发写与双向 watch。
 - **M2b（已完成）**：临时实例跨节点同步——`internal/naming/sync`（增量广播/12s 对账/3s ping 15s 判死/snapshot 拉取）+ 内部 gRPC 五种 JSON 消息；e2e 锁定双节点互见+跨节点推送、杀节点 15s 内清理（raft 失多数派仍 AP）、新节点全量拉取、丢增量靠对账收敛。
+- **节点移除（已完成）**：`/Cluster/remove` + admin 入口、naming 成员差集 sweep、被移除节点自动停服；e2e 锁定 follower/leader 移除、follower 重定向、末位守卫、移除后重 join，并保留失多数派 death 回归。
 - **M3（按需）**：鉴权、更多 ability 协商。
 
 ## 运行与测试

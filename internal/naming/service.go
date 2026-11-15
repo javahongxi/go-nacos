@@ -619,6 +619,29 @@ func (s *Service) PurgeNode(from string) {
 	}
 }
 
+// PurgeAbsentNodes drops replicas whose origin node left the raft member
+// table (a committed removal). The keep set includes the caller itself, so
+// local entries are exempt. Like PurgeNode this never emits: every node
+// sweeps its own replicas independently, and a missed sweep heals next tick.
+func (s *Service) PurgeAbsentNodes(keep map[string]bool) {
+	s.mu.Lock()
+	changed := map[string]Key{}
+	now := time.Now().UnixMilli()
+	for ks, st := range s.services {
+		for ik, e := range st.instances {
+			if !keep[e.originNode] {
+				delete(st.instances, ik)
+				st.lastUpdated = now
+				changed[ks] = st.key
+			}
+		}
+	}
+	s.mu.Unlock()
+	for _, k := range changed {
+		go s.push(k)
+	}
+}
+
 // RestoreSnapshot applies a full-state pull, keeping each entry's true
 // origin so death cleanup stays correct on the puller too. Our own entries
 // never come back stale, and local takeovers are never overwritten.

@@ -27,6 +27,8 @@ const maxMsgSize = 32 << 20
 const (
 	TypeJoinRequest      = "JoinRequest"
 	TypeJoinResponse     = "JoinResponse"
+	TypeRemoveRequest    = "RemoveRequest"
+	TypeRemoveResponse   = "RemoveResponse"
 	TypeForwardRequest   = "ForwardRequest"
 	TypeForwardResponse  = "ForwardResponse"
 	TypeSyncResponse     = "SyncResponse"
@@ -44,6 +46,20 @@ type JoinRequest struct {
 // JoinResponse: OK on acceptance; otherwise LeaderID redirects the caller to
 // the current leader (empty when no leader is known yet — retry the same peer).
 type JoinResponse struct {
+	OK       bool   `json:"ok"`
+	LeaderID string `json:"leaderId,omitempty"`
+	Message  string `json:"message,omitempty"`
+}
+
+// RemoveRequest asks the leader to drop a voter (scale-down). NodeID is the
+// target's cluster identity (its gRPC address).
+type RemoveRequest struct {
+	NodeID string `json:"nodeId"`
+}
+
+// RemoveResponse: OK on removal (or when the target is already absent);
+// otherwise LeaderID redirects the caller to the current leader.
+type RemoveResponse struct {
 	OK       bool   `json:"ok"`
 	LeaderID string `json:"leaderId,omitempty"`
 	Message  string `json:"message,omitempty"`
@@ -126,6 +142,13 @@ func (c *Client) invoke(ctx context.Context, addr, method, typeName string, body
 func (c *Client) Join(ctx context.Context, addr string, req JoinRequest) (JoinResponse, error) {
 	var resp JoinResponse
 	err := c.invoke(ctx, addr, "/Cluster/join", TypeJoinRequest, req, &resp)
+	return resp, err
+}
+
+// Remove asks a peer to drop a voter; the caller follows leader redirects.
+func (c *Client) Remove(ctx context.Context, addr string, req RemoveRequest) (RemoveResponse, error) {
+	var resp RemoveResponse
+	err := c.invoke(ctx, addr, "/Cluster/remove", TypeRemoveRequest, req, &resp)
 	return resp, err
 }
 
