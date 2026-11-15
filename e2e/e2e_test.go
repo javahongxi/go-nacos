@@ -18,15 +18,19 @@ import (
 	"github.com/javahongxi/sweet/nacos"
 )
 
-func newApp(t *testing.T, dir string) *app.App {
+func newApp(t *testing.T, dir string, tune ...func(*app.Options)) *app.App {
 	t.Helper()
-	a, err := app.New(app.Options{
+	opts := app.Options{
 		GRPCListen:  "127.0.0.1:0",
 		RaftListen:  "127.0.0.1:0",
 		AdminListen: "127.0.0.1:0",
 		DataDir:     dir,
 		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-	})
+	}
+	for _, f := range tune {
+		f(&opts)
+	}
+	a, err := app.New(opts)
 	if err != nil {
 		t.Fatalf("app.New: %v", err)
 	}
@@ -423,5 +427,78 @@ func adminGet(t *testing.T, url string, out any) {
 	}
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
 		t.Fatalf("decode %s: %v", url, err)
+	}
+}
+
+// TestNamingEmptyServiceClean locks the Java-aligned cleaner semantics: the
+// empty shell is dropped, the subscriber index survives, and a later
+// registration still pushes to the ORIGINAL subscriber (no reconnect).
+func TestNamingEmptyServiceClean(t *testing.T) {
+	a := newApp(t, t.TempDir(), func(o *app.Options) {
+		o.NamingCleanExpire = 100 * time.Millisecond
+		o.NamingCleanInterval = 50 * time.Millisecond
+	})
+	provider := newNaming(t, a.Addr())
+	consumer := newNaming(t, a.Addr())
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const svc = "clean.Svc"
+	inst := nacos.Instance{IP: "127.0.0.1", Port: 22000, Weight: 1, Healthy: true, Enabled: true, Ephemeral: true}
+	if err := provider.Register(ctx, svc, inst); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if _, err := consumer.Subscribe(ctx, svc); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	// Provider dies: the instance goes, the consumer gets the empty push.
+	provider.Close()
+	waitHosts(t, consumer.Updates(), 0)
+
+	// The cleaner drops the empty shell but must keep the subscriber index.
+	base := "http://" + a.AdminAddr()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var services []struct {
+			Name string `json:"name"`
+		}
+		adminGet(t, base+"/api/services", &services)
+		gone := true
+		for _, s := range services {
+			if s.Name == svc {
+				gone = false
+			}
+		}
+		if gone {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("empty service shell was never cleaned")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	var sd struct {
+		ServiceInfo struct {
+			Hosts []struct {
+				IP string `json:"ip"`
+			} `json:"hosts"`
+		} `json:"serviceInfo"`
+		Subscribers []string `json:"subscribers"`
+	}
+	adminGet(t, base+"/api/service?name="+svc+"&group=DEFAULT_GROUP&namespace=public", &sd)
+	if len(sd.ServiceInfo.Hosts) != 0 || len(sd.Subscribers) != 1 {
+		t.Fatalf("after clean: hosts=%d subscribers=%d, want 0/1", len(sd.ServiceInfo.Hosts), len(sd.Subscribers))
+	}
+
+	// A brand-new provider registers the same service: the ORIGINAL consumer,
+	// still on its first connection, must receive the push.
+	provider2 := newNaming(t, a.Addr())
+	if err := provider2.Register(ctx, svc, inst); err != nil {
+		t.Fatalf("re-register: %v", err)
+	}
+	waitHosts(t, consumer.Updates(), 1)
+	if h := consumer.Handshakes(); h != 1 {
+		t.Fatalf("consumer handshakes = %d, want 1 (no reconnect)", h)
 	}
 }

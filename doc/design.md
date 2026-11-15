@@ -55,7 +55,7 @@ graph TD
 | `internal/wire` | 信封编解码 + 全部 JSON DTO（tag 与 sweet 逐字对齐） |
 | `internal/conn` | 连接注册表（peer addr → connection）、推送 ack 重试、断连清理钩子 |
 | `internal/config` | bbolt 存储、raft FSM（CAS 在 Apply 内）、listen/notify 服务 |
-| `internal/naming` | 内存实例表 + 订阅表，连接即活性 |
+| `internal/naming` | 内存实例表 + 独立订阅索引 + 空服务清理器，连接即活性 |
 | `internal/raftnode` | hashicorp/raft 组装：bolt log+stable、file snapshot、TCP transport、单节点 bootstrap |
 | `internal/grpcserver` | 两个 ServiceDesc、unary 分发、bidi 流生命周期 |
 | `internal/admin` | 只读观测台：独立 HTTP 端口 + embed 单页前端，GET-only |
@@ -74,11 +74,13 @@ graph TD
 8. **旧流清理带 ID 比对**：重连竞态下旧流的 Unregister 不会误清新连接。
 9. **信封类型复用 sweet/gen，不另 vendored**：protobuf 全局注册表按 proto 文件名去重，服务端与客户端各持一份同名 `nacos_grpc_service.proto` 会在 e2e 二进制 init 时 panic（"file already registered"）。共享同一生成包既消除冲突，又让服务端/客户端线级孪生由构造保证。代价是服务端依赖 sweet 模块（仅 gen 包，纯 protobuf 类型）。
 10. **只读观测台与 SDK 路径隔离**：Java/r-nacos 控制台各吃一套私有 HTTP 管理契约，与 gRPC-only 服务端错配，故自建。`internal/admin` 独立端口（默认 127.0.0.1:8848，`off` 禁用）、全部 GET-only（写方法 405）、embed 前端零外部依赖；领域服务只新增纯只读快照方法（`List`/`All`/`Subscribers`），gRPC handler 零改动。
+11. **空服务清理严格对齐 Java**：订阅索引提升到 Service 顶层独立保存（对应 `ClientServiceIndexesManager` 的 publisherIndexes/subscriberIndexes 分离）；清理器 60s 周期扫描，只删无实例且最后实例变更超 60s 的服务壳（`EmptyServiceAutoCleanerV2`），不动订阅索引——清壳后新注册仍推到旧订阅者，客户端无需重连。壳上 `lastUpdated` 只在实例变更时刷新（Java：`ServiceChangedEvent` → `Service.renewUpdateTime`，订阅不刷新）。
 
 ## 里程碑
 
 - **M1（已完成）**：单机完整闭环——握手/保活、config CRUD+CAS+listen+notify、naming 注册/订阅/推送/断连清理、raft+bbolt 持久化、sweet e2e（含重启持久化、断线重放）。
-- **观测台（本次）**：`internal/admin` 只读控制台——config 列表/内容、naming 服务/实例/订阅者、连接列表、raft 状态；embed 单页前端 5s 自动刷新，e2e 覆盖全部接口与 405 只读校验。
+- **观测台（已完成）**：`internal/admin` 只读控制台——config 列表/内容、naming 服务/实例/订阅者、连接列表、raft 状态；embed 单页前端 5s 自动刷新，e2e 覆盖全部接口与 405 只读校验。
+- **空服务清理（本次）**：订阅索引独立 + 60s 过期/60s 周期清理器，严格对齐 Java；e2e 锁定“清壳后新注册推到旧订阅者（无重连）”。
 - **M2**：多节点——join/成员变更、写请求 leader 路由（或重定向）、临时实例跨节点同步、快照传输验证。
 - **M3（按需）**：鉴权、持久实例、更多 ability 协商、metrics。
 

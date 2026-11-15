@@ -2,6 +2,10 @@
 // their liveness IS the connection (no beat in the gRPC model). Nothing here
 // goes through raft — cluster-wide instance sync is an M2 topic (r-nacos
 // splits the same way: config through raft, ephemeral instances not).
+//
+// Publisher and subscriber indexes are kept apart, mirroring Java's
+// ClientServiceIndexesManager: the empty-service cleaner drops instance-less
+// service shells without touching subscriptions, so pushes survive cleanup.
 package naming
 
 import (
@@ -33,26 +37,71 @@ type instanceEntry struct {
 type serviceState struct {
 	key         Key
 	instances   map[string]instanceEntry // ip#port#cluster → entry
-	subscribers map[string]bool          // connID set
+	lastUpdated int64                    // UnixMilli of the last instance change
 }
 
-// Service owns the instance and subscription tables. Both are keyed by
-// connection for cleanup: when a connection retires, everything it registered
-// or subscribed goes with it.
+// Service owns the instance shells and an independent subscriber index
+// (serviceKey → connID set), mirroring Java's publisherIndexes /
+// subscriberIndexes split. When a connection retires, everything it registered
+// or subscribed goes with it; the empty-service cleaner only drops shells.
 type Service struct {
-	mu       sync.Mutex
-	services map[string]*serviceState
-	conns    *conn.Registry
-	logger   *slog.Logger
+	mu          sync.Mutex
+	services    map[string]*serviceState
+	subscribers map[string]map[string]bool
+	conns       *conn.Registry
+	logger      *slog.Logger
+
+	cleanExpire time.Duration
+	cleanEvery  time.Duration
+	stopClean   chan struct{}
+	cleanDone   chan struct{}
+	closeOnce   sync.Once
 }
 
-func NewService(conns *conn.Registry, logger *slog.Logger) *Service {
+// Option tunes a Service at construction.
+type Option func(*Service)
+
+// WithCleanerTiming overrides the empty-service cleaner's expiry and scan
+// interval (Java defaults: 60s each). Non-positive values keep the default.
+func WithCleanerTiming(expire, interval time.Duration) Option {
+	return func(s *Service) {
+		if expire > 0 {
+			s.cleanExpire = expire
+		}
+		if interval > 0 {
+			s.cleanEvery = interval
+		}
+	}
+}
+
+func NewService(conns *conn.Registry, logger *slog.Logger, opts ...Option) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	s := &Service{services: map[string]*serviceState{}, conns: conns, logger: logger}
+	s := &Service{
+		services:    map[string]*serviceState{},
+		subscribers: map[string]map[string]bool{},
+		conns:       conns,
+		logger:      logger,
+		cleanExpire: 60 * time.Second,
+		cleanEvery:  60 * time.Second,
+		stopClean:   make(chan struct{}),
+		cleanDone:   make(chan struct{}),
+	}
+	for _, o := range opts {
+		o(s)
+	}
 	conns.OnClose(s.removeConn)
+	go s.cleanLoop()
 	return s
+}
+
+// Close stops the empty-service cleaner.
+func (s *Service) Close() {
+	s.closeOnce.Do(func() {
+		close(s.stopClean)
+		<-s.cleanDone
+	})
 }
 
 func instanceKey(inst wire.Instance) string {
@@ -74,6 +123,7 @@ func (s *Service) Register(k Key, inst wire.Instance, connID string) error {
 	s.mu.Lock()
 	st := s.stateLocked(k)
 	st.instances[instanceKey(inst)] = instanceEntry{inst: inst, connID: connID}
+	st.lastUpdated = time.Now().UnixMilli()
 	s.mu.Unlock()
 	go s.push(k)
 	return nil
@@ -91,6 +141,7 @@ func (s *Service) Deregister(k Key, inst wire.Instance, connID string) {
 		ik := instanceKey(inst)
 		if e, ok := st.instances[ik]; ok && e.connID == connID {
 			delete(st.instances, ik)
+			st.lastUpdated = time.Now().UnixMilli()
 			changed = true
 		}
 	}
@@ -107,12 +158,21 @@ func (s *Service) Query(k Key, cluster string, healthyOnly bool) wire.ServiceInf
 // Subscribe turns pushes on/off for one connection and returns the current
 // snapshot, so a subscriber never needs a separate query.
 func (s *Service) Subscribe(k Key, connID string, subscribe bool) wire.ServiceInfo {
+	ks := k.String()
 	s.mu.Lock()
-	st := s.stateLocked(k)
 	if subscribe {
-		st.subscribers[connID] = true
-	} else {
-		delete(st.subscribers, connID)
+		m := s.subscribers[ks]
+		if m == nil {
+			m = map[string]bool{}
+			s.subscribers[ks] = m
+		}
+		m[connID] = true
+		s.stateLocked(k) // keep the shell visible to List while subscribed
+	} else if m := s.subscribers[ks]; m != nil {
+		delete(m, connID)
+		if len(m) == 0 {
+			delete(s.subscribers, ks)
+		}
 	}
 	s.mu.Unlock()
 	return s.snapshot(k, "", false)
@@ -124,7 +184,7 @@ func (s *Service) stateLocked(k Key) *serviceState {
 		st = &serviceState{
 			key:         k,
 			instances:   map[string]instanceEntry{},
-			subscribers: map[string]bool{},
+			lastUpdated: time.Now().UnixMilli(),
 		}
 		s.services[k.String()] = st
 	}
@@ -137,13 +197,21 @@ func (s *Service) stateLocked(k Key) *serviceState {
 func (s *Service) removeConn(connID string) {
 	s.mu.Lock()
 	changed := map[string]Key{}
-	for _, st := range s.services {
-		delete(st.subscribers, connID)
+	now := time.Now().UnixMilli()
+	for ks, st := range s.services {
 		for ik, e := range st.instances {
 			if e.connID == connID {
 				delete(st.instances, ik)
-				changed[st.key.String()] = st.key
+				st.lastUpdated = now
+				changed[ks] = st.key
 			}
+		}
+	}
+	// Java drops the subscriber index on client release too.
+	for ks, m := range s.subscribers {
+		delete(m, connID)
+		if len(m) == 0 {
+			delete(s.subscribers, ks)
 		}
 	}
 	s.mu.Unlock()
@@ -198,12 +266,9 @@ func qualifiedName(name, group string) string {
 func (s *Service) push(k Key) {
 	info := s.snapshot(k, "", false)
 	s.mu.Lock()
-	st := s.services[k.String()]
 	var ids []string
-	if st != nil {
-		for id := range st.subscribers {
-			ids = append(ids, id)
-		}
+	for id := range s.subscribers[k.String()] {
+		ids = append(ids, id)
 	}
 	s.mu.Unlock()
 	for _, id := range ids {
@@ -227,6 +292,41 @@ func (s *Service) push(k Key) {
 	}
 }
 
+// cleanLoop scans for empty service shells on a fixed interval, mirroring
+// EmptyServiceAutoCleanerV2 (Java: 60s expiry + 60s scan). Only the shell is
+// dropped — the subscriber index survives, so a later registration still
+// pushes to the original subscribers without any client reconnect.
+func (s *Service) cleanLoop() {
+	defer close(s.cleanDone)
+	t := time.NewTicker(s.cleanEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.stopClean:
+			return
+		case <-t.C:
+			s.cleanEmptyServices()
+		}
+	}
+}
+
+// cleanEmptyServices drops shells with no instances whose last instance
+// change is older than the expiry. lastUpdated tracks instance changes only
+// (Java: ServiceChangedEvent → Service.renewUpdateTime; subscribes don't
+// renew it).
+func (s *Service) cleanEmptyServices() {
+	now := time.Now().UnixMilli()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for ks, st := range s.services {
+		if len(st.instances) == 0 && now-st.lastUpdated >= s.cleanExpire.Milliseconds() {
+			delete(s.services, ks)
+			s.logger.Info("naming: empty service cleaned",
+				"namespace", st.key.Namespace, "group", st.key.Group, "service", st.key.Name)
+		}
+	}
+}
+
 // ServiceSummary is a read-only service row for the admin console.
 type ServiceSummary struct {
 	Namespace   string `json:"namespace"`
@@ -241,10 +341,10 @@ func (s *Service) List() []ServiceSummary {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]ServiceSummary, 0, len(s.services))
-	for _, st := range s.services {
+	for ks, st := range s.services {
 		out = append(out, ServiceSummary{
 			Namespace: st.key.Namespace, Group: st.key.Group, Name: st.key.Name,
-			Instances: len(st.instances), Subscribers: len(st.subscribers),
+			Instances: len(st.instances), Subscribers: len(s.subscribers[ks]),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -263,12 +363,12 @@ func (s *Service) List() []ServiceSummary {
 func (s *Service) Subscribers(k Key) []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	st := s.services[k.String()]
-	if st == nil {
+	m := s.subscribers[k.String()]
+	if len(m) == 0 {
 		return nil
 	}
-	out := make([]string, 0, len(st.subscribers))
-	for id := range st.subscribers {
+	out := make([]string, 0, len(m))
+	for id := range m {
 		out = append(out, id)
 	}
 	sort.Strings(out)

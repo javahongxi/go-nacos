@@ -26,6 +26,9 @@ type Options struct {
 	AdminListen string // read-only console address, default 127.0.0.1:8848 ("off" disables)
 	DataDir     string // default "data"
 	Logger      *slog.Logger
+
+	NamingCleanExpire   time.Duration // empty-service expiry, zero = 60s (Java default)
+	NamingCleanInterval time.Duration // empty-service scan interval, zero = 60s
 }
 
 type App struct {
@@ -77,7 +80,7 @@ func New(opts Options) (*App, error) {
 	}
 	conns := conn.NewRegistry(opts.Logger)
 	cfg := config.NewService(node.Raft, fsm, conns, opts.Logger)
-	namingSvc := naming.NewService(conns, opts.Logger)
+	namingSvc := naming.NewService(conns, opts.Logger, naming.WithCleanerTiming(opts.NamingCleanExpire, opts.NamingCleanInterval))
 	srv := grpcserver.New(conns, cfg, namingSvc, opts.Logger)
 
 	lis, err := net.Listen("tcp", opts.GRPCListen)
@@ -125,6 +128,7 @@ func (a *App) Start() error {
 func (a *App) Stop() {
 	a.stopOnce.Do(func() {
 		a.GRPC.Stop()
+		a.Naming.Close()
 		if a.Admin != nil {
 			a.Admin.Close()
 		}
