@@ -83,7 +83,7 @@ func (s *Server) overview(w http.ResponseWriter, _ *http.Request) {
 		"services":    len(s.naming.List()),
 		"connections": len(s.conns.List()),
 		"raftState":   s.raft.Raft.State().String(),
-		"raftLeader":  string(s.raft.Raft.Leader()),
+		"raftLeader":  string(leaderID(s.raft)),
 	})
 }
 
@@ -133,11 +133,24 @@ func (s *Server) connections(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) raftStatus(w http.ResponseWriter, _ *http.Request) {
 	node := s.raft.Raft
+	members := make([]map[string]string, 0)
+	for _, sv := range s.raft.Voters() {
+		members = append(members, map[string]string{"id": string(sv.ID), "raftAddr": string(sv.Address)})
+	}
 	writeJSON(w, map[string]any{
-		"state":  node.State().String(),
-		"leader": string(node.Leader()),
-		"stats":  node.Stats(),
+		"state":   node.State().String(),
+		"nodeId":  s.raft.NodeID(),
+		"leader":  string(leaderID(s.raft)),
+		"members": members,
+		"stats":   node.Stats(),
 	})
+}
+
+// leaderID reports the leader's node identity (its gRPC address), not the
+// internal raft transport address, so the console matches join/member IDs.
+func leaderID(n *raftnode.Node) string {
+	_, id := n.Raft.LeaderWithID()
+	return string(id)
 }
 
 // configPublish creates or updates a config through raft. A non-empty

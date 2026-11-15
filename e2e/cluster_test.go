@@ -33,8 +33,8 @@ func TestClusterConfigForwarding(t *testing.T) {
 		Leader string `json:"leader"`
 	}
 	adminGet(t, "http://"+a2.AdminAddr()+"/api/raft", &rs)
-	if rs.State != "Follower" || rs.Leader != a1.Raft.RaftAddr() {
-		t.Fatalf("a2 raft = %+v, want Follower of %s", rs, a1.Raft.RaftAddr())
+	if rs.State != "Follower" || rs.Leader != a1.Addr() {
+		t.Fatalf("a2 raft = %+v, want Follower of %s", rs, a1.Addr())
 	}
 
 	key := nacos.ConfigKey{DataID: "cluster.yaml", Group: "DEFAULT_GROUP"}

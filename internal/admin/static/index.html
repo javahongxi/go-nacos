@@ -168,7 +168,13 @@ const renderers = {
   },
   async raft() {
     const d = await get('/api/raft');
-    let h = `<div class="detail"><h3>状态: ${esc(d.state)} &nbsp; <span class="mut">leader:</span> <span class="mono">${esc(d.leader||'-')}</span></h3>`;
+    let h = `<div class="detail"><h3>状态: ${esc(d.state)} &nbsp; <span class="mut">本节点:</span> <span class="mono">${esc(d.nodeId||'-')}</span> &nbsp; <span class="mut">leader:</span> <span class="mono">${esc(d.leader||'-')}</span></h3>`;
+    h += '<h3>成员</h3>';
+    h += table([
+      ['节点（gRPC 地址）', x=>esc(x.id)+(x.id===d.leader?' <span class="badge leader">leader</span>':''), 'mono'],
+      ['raft 地址', x=>esc(x.raftAddr), 'mono'],
+    ], d.members||[]);
+    h += '<h3>指标</h3>';
     const stats = Object.entries(d.stats||{}).map(([k,v])=>({k,v}));
     h += table([['指标', x=>esc(x.k), 'mono'], ['值', x=>esc(x.v), 'mono']], stats);
     h += '</div>';
