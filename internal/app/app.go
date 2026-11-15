@@ -23,11 +23,10 @@ import (
 )
 
 type Options struct {
-	GRPCListen  string // gRPC SDK address, default 127.0.0.1:9848
-	RaftListen  string // raft transport address, default 127.0.0.1:9849
-	SyncListen  string // internal node-to-node address, default 127.0.0.1:9850
-	AdminListen string // read-only console address, default 127.0.0.1:8848 ("off" disables)
-	JoinAddr    string // existing node's sync address; empty = bootstrap a new cluster
+	GRPCListen  string // gRPC address (SDK + internal cluster RPCs), default 127.0.0.1:9848 (Nacos: main port + 1000)
+	RaftListen  string // raft transport address, default 127.0.0.1:7848 (Nacos: main port - 1000)
+	AdminListen string // read-only console address, default 127.0.0.1:8080 (Nacos 3.x console port; "off" disables)
+	JoinAddr    string // existing node's gRPC address; empty = bootstrap a new cluster
 	DataDir     string // default "data"
 	Logger      *slog.Logger
 
@@ -47,7 +46,6 @@ type App struct {
 
 	store         *config.Store
 	lis           net.Listener
-	syncLis       net.Listener
 	clusterClient *cluster.Client
 	nodeID        string
 	joinAddr      string
@@ -59,13 +57,10 @@ func New(opts Options) (*App, error) {
 		opts.GRPCListen = "127.0.0.1:9848"
 	}
 	if opts.RaftListen == "" {
-		opts.RaftListen = "127.0.0.1:9849"
-	}
-	if opts.SyncListen == "" {
-		opts.SyncListen = "127.0.0.1:9850"
+		opts.RaftListen = "127.0.0.1:7848"
 	}
 	if opts.AdminListen == "" {
-		opts.AdminListen = "127.0.0.1:8848"
+		opts.AdminListen = "127.0.0.1:8080"
 	}
 	if opts.DataDir == "" {
 		opts.DataDir = "data"
@@ -77,23 +72,24 @@ func New(opts Options) (*App, error) {
 		return nil, fmt.Errorf("app: data dir: %w", err)
 	}
 
-	// The internal listener comes first: its bound address is the node's
-	// cluster identity (raft ServerID), so a :0 listen works in tests.
-	syncLis, err := net.Listen("tcp", opts.SyncListen)
+	// The gRPC listener comes first: its bound address is the node's cluster
+	// identity (raft ServerID), so a :0 listen works in tests. Internal
+	// cluster RPCs share this port with the SDK services.
+	lis, err := net.Listen("tcp", opts.GRPCListen)
 	if err != nil {
-		return nil, fmt.Errorf("app: sync listen %s: %w", opts.SyncListen, err)
+		return nil, fmt.Errorf("app: listen %s: %w", opts.GRPCListen, err)
 	}
-	nodeID := syncLis.Addr().String()
+	nodeID := lis.Addr().String()
 
 	store, err := config.OpenStore(filepath.Join(opts.DataDir, "config.db"))
 	if err != nil {
-		syncLis.Close()
+		lis.Close()
 		return nil, err
 	}
 	fsm, err := config.NewFSM(store)
 	if err != nil {
 		store.Close()
-		syncLis.Close()
+		lis.Close()
 		return nil, err
 	}
 	raftOpts := []raftnode.Option{raftnode.WithNodeID(nodeID)}
@@ -103,7 +99,7 @@ func New(opts Options) (*App, error) {
 	node, err := raftnode.New(opts.DataDir, opts.RaftListen, fsm, raftOpts...)
 	if err != nil {
 		store.Close()
-		syncLis.Close()
+		lis.Close()
 		return nil, err
 	}
 	conns := conn.NewRegistry(nodeID, opts.Logger)
@@ -112,7 +108,7 @@ func New(opts Options) (*App, error) {
 	namingSvc := naming.NewService(conns, opts.Logger,
 		naming.WithCleanerTiming(opts.NamingCleanExpire, opts.NamingCleanInterval),
 		naming.WithNodeID(nodeID))
-	// The raft member table is the peer list: ServerID IS the sync address.
+	// The raft member table is the peer list: ServerID IS the gRPC address.
 	peers := func() []string {
 		servers := node.Voters()
 		out := make([]string, 0, len(servers))
@@ -123,24 +119,17 @@ func New(opts Options) (*App, error) {
 	}
 	syncMgr := nsync.New(nodeID, namingSvc, clusterClient, peers, opts.Logger)
 	namingSvc.SetEmitter(syncMgr)
-	clusterSrv := cluster.NewServer(node, cfg, syncMgr, syncLis, opts.Logger)
+	clusterSrv := cluster.NewServer(node, cfg, syncMgr, opts.Logger)
 	srv := grpcserver.New(conns, cfg, namingSvc, opts.Logger)
+	clusterSrv.Register(srv.Raw())
 
-	lis, err := net.Listen("tcp", opts.GRPCListen)
-	if err != nil {
-		node.Close()
-		store.Close()
-		syncLis.Close()
-		clusterClient.Close()
-		return nil, fmt.Errorf("app: listen %s: %w", opts.GRPCListen, err)
-	}
 	var adminSrv *admin.Server
 	if opts.AdminListen != "off" {
 		adminLis, err := net.Listen("tcp", opts.AdminListen)
 		if err != nil {
 			node.Close()
 			store.Close()
-			syncLis.Close()
+			lis.Close()
 			clusterClient.Close()
 			return nil, fmt.Errorf("app: admin listen %s: %w", opts.AdminListen, err)
 		}
@@ -148,16 +137,13 @@ func New(opts Options) (*App, error) {
 	}
 	return &App{
 		Conns: conns, Config: cfg, Naming: namingSvc, Raft: node, GRPC: srv, Admin: adminSrv, Cluster: clusterSrv, Sync: syncMgr,
-		store: store, lis: lis, syncLis: syncLis, clusterClient: clusterClient, nodeID: nodeID, joinAddr: opts.JoinAddr,
+		store: store, lis: lis, clusterClient: clusterClient, nodeID: nodeID, joinAddr: opts.JoinAddr,
 	}, nil
 }
 
-// Addr is the bound gRPC address (meaningful with a :0 listen).
+// Addr is the bound gRPC address — also the node's cluster identity and the
+// address peers join through (meaningful with a :0 listen).
 func (a *App) Addr() string { return a.lis.Addr().String() }
-
-// SyncAddr is the bound internal address — the node's cluster identity and
-// the address peers join through.
-func (a *App) SyncAddr() string { return a.syncLis.Addr().String() }
 
 // AdminAddr is the bound console address ("" when admin is disabled).
 func (a *App) AdminAddr() string {
@@ -172,7 +158,6 @@ func (a *App) AdminAddr() string {
 // it returns.
 func (a *App) Start() error {
 	go func() { _ = a.GRPC.Serve(a.lis) }()
-	go func() { _ = a.Cluster.Serve() }()
 	if a.Admin != nil {
 		go func() { _ = a.Admin.Serve() }()
 	}
@@ -235,7 +220,6 @@ func (a *App) shutdown(hard bool) {
 	if a.Admin != nil {
 		a.Admin.Close()
 	}
-	a.Cluster.Stop()
 	_ = a.Raft.Close()
 	_ = a.store.Close()
 	a.clusterClient.Close()

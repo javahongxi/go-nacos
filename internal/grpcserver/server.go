@@ -32,11 +32,17 @@ func New(conns *conn.Registry, cfg *config.Service, naming *naming.Service, logg
 		logger = slog.Default()
 	}
 	s := &Server{conns: conns, cfg: cfg, naming: naming, logger: logger}
-	s.grpc = grpc.NewServer(grpc.MaxRecvMsgSize(10 << 20))
+	// 32MB: the internal Cluster service shares this server, and snapshot
+	// pulls can be large.
+	s.grpc = grpc.NewServer(grpc.MaxRecvMsgSize(32 << 20))
 	s.grpc.RegisterService(&requestDesc, s)
 	s.grpc.RegisterService(&biStreamDesc, s)
 	return s
 }
+
+// Raw exposes the underlying gRPC server for service registration at wiring
+// time (before Serve) — the internal Cluster service rides this server.
+func (s *Server) Raw() *grpc.Server { return s.grpc }
 
 // serverAPI is the HandlerType both ServiceDescs check against — grpc requires
 // an interface here (it does reflect.TypeOf(HandlerType).Elem().Implements).

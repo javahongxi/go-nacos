@@ -25,7 +25,6 @@ func newApp(t *testing.T, dir string, tune ...func(*app.Options)) *app.App {
 	opts := app.Options{
 		GRPCListen:  "127.0.0.1:0",
 		RaftListen:  "127.0.0.1:0",
-		SyncListen:  "127.0.0.1:0",
 		AdminListen: "127.0.0.1:0",
 		DataDir:     dir,
 		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -76,13 +75,13 @@ func waitReady(t *testing.T, c interface{ WaitReady(context.Context) error }) {
 	}
 }
 
-// pinnedSyncListen reserves a free port so a restarted node can reuse the
-// same sync address (and thus the same cluster identity).
-func pinnedSyncListen(t *testing.T) string {
+// pinnedGRPCListen reserves a free port so a restarted node can reuse the
+// same gRPC address (and thus the same cluster identity).
+func pinnedGRPCListen(t *testing.T) string {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("reserve sync port: %v", err)
+		t.Fatalf("reserve grpc port: %v", err)
 	}
 	addr := l.Addr().String()
 	l.Close()
@@ -164,10 +163,10 @@ func TestConfigLifecycle(t *testing.T) {
 
 func TestConfigPersistence(t *testing.T) {
 	dir := t.TempDir()
-	// Node identity IS the sync address, so a restart keeps it only on a
+	// Node identity IS the gRPC address, so a restart keeps it only on a
 	// fixed port — exactly the production setup.
-	syncAddr := pinnedSyncListen(t)
-	pin := func(o *app.Options) { o.SyncListen = syncAddr }
+	grpcAddr := pinnedGRPCListen(t)
+	pin := func(o *app.Options) { o.GRPCListen = grpcAddr }
 	a := newApp(t, dir, pin)
 	c := newConfig(t, a.Addr())
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)

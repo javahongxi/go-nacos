@@ -31,9 +31,10 @@ type options struct {
 	join   bool
 }
 
-// WithNodeID sets the raft ServerID. go-nacos identifies a node by its
-// internal sync address, so the raft configuration doubles as the cluster
-// member table: ID = sync address (dialable), Address = raft transport.
+// WithNodeID sets the raft ServerID. go-nacos identifies a node by its gRPC
+// address (SDK and internal cluster RPCs share it), so the raft configuration
+// doubles as the cluster member table: ID = gRPC address (dialable),
+// Address = raft transport.
 func WithNodeID(id string) Option { return func(o *options) { o.nodeID = id } }
 
 // WithJoin skips bootstrap on a fresh node: an existing leader AddVoters us
@@ -98,14 +99,14 @@ func New(dataDir, listen string, fsm raft.FSM, opts ...Option) (*Node, error) {
 	return &Node{Raft: r, transport: transport, logs: logs, nodeID: string(cfg.LocalID)}, nil
 }
 
-// NodeID is this node's cluster identity (its internal sync address).
+// NodeID is this node's cluster identity (its gRPC address).
 func (n *Node) NodeID() string { return n.nodeID }
 
 // RaftAddr is the bound raft transport address (meaningful with a :0 listen).
 func (n *Node) RaftAddr() string { return string(n.transport.LocalAddr()) }
 
 // Voters lists the current raft configuration — the cluster member table the
-// naming sync module builds on. ID is the member's sync address.
+// naming sync module builds on. ID is the member's gRPC address.
 func (n *Node) Voters() []raft.Server {
 	f := n.Raft.GetConfiguration()
 	if err := f.Error(); err != nil {

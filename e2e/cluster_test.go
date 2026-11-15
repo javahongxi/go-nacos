@@ -10,7 +10,7 @@ import (
 )
 
 // newClusterApp starts one node: join == "" bootstraps a fresh cluster,
-// otherwise the node joins through that peer's internal sync address.
+// otherwise the node joins through that peer's gRPC address.
 func newClusterApp(t *testing.T, dir, join string) *app.App {
 	t.Helper()
 	return newApp(t, dir, func(o *app.Options) { o.JoinAddr = join })
@@ -21,7 +21,7 @@ func newClusterApp(t *testing.T, dir, join string) *app.App {
 // watchers on BOTH nodes regardless of where the write landed.
 func TestClusterConfigForwarding(t *testing.T) {
 	a1 := newClusterApp(t, t.TempDir(), "")
-	a2 := newClusterApp(t, t.TempDir(), a1.SyncAddr())
+	a2 := newClusterApp(t, t.TempDir(), a1.Addr())
 	c1 := newConfig(t, a1.Addr())
 	c2 := newConfig(t, a2.Addr())
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -163,7 +163,7 @@ func waitHostsWithin(t *testing.T, updates <-chan nacos.ServiceInfo, want int, d
 // connection death propagate the same way.
 func TestClusterNamingSync(t *testing.T) {
 	a1 := newClusterApp(t, t.TempDir(), "")
-	a2 := newClusterApp(t, t.TempDir(), a1.SyncAddr())
+	a2 := newClusterApp(t, t.TempDir(), a1.Addr())
 	provider1 := newNaming(t, a1.Addr())
 	provider2 := newNaming(t, a2.Addr())
 	consumer1 := newNaming(t, a1.Addr())
@@ -212,7 +212,7 @@ func TestClusterNamingSync(t *testing.T) {
 // window — even though raft has lost quorum (naming stays AP).
 func TestClusterNodeDeath(t *testing.T) {
 	a1 := newClusterApp(t, t.TempDir(), "")
-	a2 := newClusterApp(t, t.TempDir(), a1.SyncAddr())
+	a2 := newClusterApp(t, t.TempDir(), a1.Addr())
 	provider := newNaming(t, a1.Addr())
 	consumer := newNaming(t, a2.Addr())
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
@@ -238,7 +238,7 @@ func TestClusterNodeDeath(t *testing.T) {
 // full state from a live peer and then participates in both directions.
 func TestClusterNewNodeSnapshot(t *testing.T) {
 	a1 := newClusterApp(t, t.TempDir(), "")
-	a2 := newClusterApp(t, t.TempDir(), a1.SyncAddr())
+	a2 := newClusterApp(t, t.TempDir(), a1.Addr())
 	provider1 := newNaming(t, a1.Addr())
 	provider2 := newNaming(t, a2.Addr())
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
@@ -257,7 +257,7 @@ func TestClusterNewNodeSnapshot(t *testing.T) {
 	waitQueryHosts(t, ctx, probe, svc, 2)
 
 	// a3 joins with an empty naming state: the snapshot pull must fill it.
-	a3 := newClusterApp(t, t.TempDir(), a1.SyncAddr())
+	a3 := newClusterApp(t, t.TempDir(), a1.Addr())
 	consumer3 := newNaming(t, a3.Addr())
 	waitQueryHosts(t, ctx, consumer3, svc, 2)
 	if _, err := consumer3.Subscribe(ctx, svc); err != nil {
@@ -279,7 +279,7 @@ func TestClusterNewNodeSnapshot(t *testing.T) {
 // deregister.
 func TestClusterReconcile(t *testing.T) {
 	a1 := newClusterApp(t, t.TempDir(), "")
-	a2 := newClusterApp(t, t.TempDir(), a1.SyncAddr())
+	a2 := newClusterApp(t, t.TempDir(), a1.Addr())
 	provider := newNaming(t, a1.Addr())
 	consumer := newNaming(t, a2.Addr())
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

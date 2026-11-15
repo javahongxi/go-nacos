@@ -1,5 +1,6 @@
 // Package cluster is the internal node-to-node transport: a small gRPC
-// service on its own port, separate from the SDK path. hashicorp/raft's
+// service registered on the SDK gRPC server (same port, separate service —
+// Java Nacos multiplexes its server gRPC the same way). hashicorp/raft's
 // transport is consensus-only (r-nacos rides its own raft network layer; we
 // cannot), so join/forward — and M2's naming sync — live here. Envelopes
 // reuse sweet/gen.Payload with JSON bodies, the same wire style as the SDK
@@ -34,7 +35,7 @@ const (
 )
 
 // JoinRequest asks the cluster to add the caller as a voter. NodeID is the
-// caller's sync address (its cluster identity), RaftAddr its raft transport.
+// caller's gRPC address (its cluster identity), RaftAddr its raft transport.
 type JoinRequest struct {
 	NodeID   string `json:"nodeId"`
 	RaftAddr string `json:"raftAddr"`

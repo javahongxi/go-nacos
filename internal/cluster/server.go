@@ -3,7 +3,6 @@ package cluster
 import (
 	"context"
 	"log/slog"
-	"net"
 	"time"
 
 	"github.com/hashicorp/raft"
@@ -27,36 +26,30 @@ type Syncer interface {
 	Snapshot() ([]byte, error)
 }
 
-// Server hosts the internal Cluster service on its own listener.
+// Server hosts the internal Cluster service. It owns no listener: the app
+// registers it on the SDK gRPC server, so node-to-node traffic rides the same
+// port as client traffic (Java Nacos multiplexes its server gRPC the same
+// way). Lifecycle belongs to that server.
 type Server struct {
 	node    *raftnode.Node
 	applier Applier
 	syncer  Syncer
-	grpc    *grpc.Server
-	lis     net.Listener
 	logger  *slog.Logger
 }
 
-func NewServer(node *raftnode.Node, applier Applier, syncer Syncer, lis net.Listener, logger *slog.Logger) *Server {
+func NewServer(node *raftnode.Node, applier Applier, syncer Syncer, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	s := &Server{node: node, applier: applier, syncer: syncer, lis: lis, logger: logger}
-	s.grpc = grpc.NewServer(grpc.MaxRecvMsgSize(maxMsgSize))
-	s.grpc.RegisterService(&clusterDesc, s)
-	return s
+	return &Server{node: node, applier: applier, syncer: syncer, logger: logger}
 }
 
-func (s *Server) Serve() error { return s.grpc.Serve(s.lis) }
-
-// Addr is the bound internal address — the node's cluster identity.
-func (s *Server) Addr() string { return s.lis.Addr().String() }
-
-func (s *Server) Stop() { s.grpc.GracefulStop() }
+// Register attaches the Cluster service to an existing gRPC server.
+func (s *Server) Register(g *grpc.Server) { g.RegisterService(&clusterDesc, s) }
 
 // handleJoin adds the caller as a voter. Only the leader mutates membership;
-// a follower answers with the leader's id (its sync address, since ServerID
-// IS the sync address) so the joiner can retry there.
+// a follower answers with the leader's id (its gRPC address, since ServerID
+// IS the gRPC address) so the joiner can retry there.
 func (s *Server) handleJoin(_ context.Context, p *gen.Payload) (*gen.Payload, error) {
 	var req JoinRequest
 	if err := wire.Decode(p, &req); err != nil {

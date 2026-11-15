@@ -43,8 +43,9 @@ graph TD
     NAM -->|push| CONN
     CONN -->|推送+ack| S
     NAM -->|Emitter 本地变更| NS[naming/sync]
-    NS -->|五种 JSON 消息| CL[cluster 内部 gRPC]
+    NS -->|五种 JSON 消息| CL[cluster 内部 gRPC 服务]
     CFG -->|非 leader 转发| CL
+    CL ---|注册于 SDK gRPC server，同端口| U
     CL <-->|join/forward/sync/snapshot| P[对端节点]
     RAFT -->|成员表 = peer 列表| NS
     B[浏览器] -->|HTTP 读+有限写| ADM[internal/admin]
@@ -62,7 +63,7 @@ graph TD
 | `internal/config` | bbolt 存储、raft FSM（CAS 在 Apply 内、OnChange 钩子）、listen/notify 服务、非 leader 写转发 |
 | `internal/naming` | 内存实例表（entry 带 originNode 归属）+ 独立订阅索引 + 空服务清理器，连接即活性；远端 apply 路径永不 emit |
 | `internal/naming/sync` | 临时实例跨节点 AP 同步：增量广播、12s 全量对账、3s ping/15s 判死、snapshot 拉取 |
-| `internal/cluster` | 内部节点间 gRPC（独立端口）：join/forward/sync/snapshot，Payload 信封 + JSON body |
+| `internal/cluster` | 内部节点间 gRPC 服务（注册在 SDK gRPC server 上，同端口）：join/forward/sync/snapshot，Payload 信封 + JSON body |
 | `internal/raftnode` | hashicorp/raft 组装：bolt log+stable、file snapshot、TCP transport、bootstrap/join、成员表访问器 |
 | `internal/grpcserver` | 两个 ServiceDesc、unary 分发、bidi 流生命周期 |
 | `internal/admin` | 观测台：独立 HTTP 端口 + embed 单页前端；读 GET-only，写限配置发布/删除 + 命名下线/删空服务 |
@@ -80,12 +81,13 @@ graph TD
 7. **connectionId 加节点前缀与原子序号**：`nodeID_millis_seq_peer`，集群唯一且防同毫秒重连碰撞；deregister 仅 connID 守卫即可跨节点安全（admin 强制下线可在副本持有节点发起）。
 8. **旧流清理带 ID 比对**：重连竞态下旧流的 Unregister 不会误清新连接。
 9. **信封类型复用 sweet/gen，不另 vendored**：protobuf 全局注册表按 proto 文件名去重，服务端与客户端各持一份同名 `nacos_grpc_service.proto` 会在 e2e 二进制 init 时 panic（"file already registered"）。共享同一生成包既消除冲突，又让服务端/客户端线级孪生由构造保证。代价是服务端依赖 sweet 模块（仅 gen 包，纯 protobuf 类型）。
-10. **观测台与 SDK 路径隔离**：Java/r-nacos 控制台各吃一套私有 HTTP 管理契约，与 gRPC-only 服务端错配，故自建。`internal/admin` 独立端口（默认 127.0.0.1:8848，`off` 禁用）、embed 前端零外部依赖；读 GET-only，写仅四条路由：配置发布/删除（走 raft，编辑带 CAS、冲突 409）与命名强制下线/删空服务（不断连接、保留订阅索引）；暂不鉴权（M3 议题），默认仅回环监听。gRPC handler 零改动。
+10. **观测台与 SDK 路径隔离**：Java/r-nacos 控制台各吃一套私有 HTTP 管理契约，与 gRPC-only 服务端错配，故自建。`internal/admin` 独立端口（默认 127.0.0.1:8080，对齐 Nacos 3.x 控制台端口，`off` 禁用）、embed 前端零外部依赖；读 GET-only，写仅四条路由：配置发布/删除（走 raft，编辑带 CAS、冲突 409）与命名强制下线/删空服务（不断连接、保留订阅索引）；暂不鉴权（M3 议题），默认仅回环监听。gRPC handler 零改动。
 11. **空服务清理严格对齐 Java**：订阅索引提升到 Service 顶层独立保存（对应 `ClientServiceIndexesManager` 的 publisherIndexes/subscriberIndexes 分离）；清理器 60s 周期扫描，只删无实例且最后实例变更超 60s 的服务壳（`EmptyServiceAutoCleanerV2`），不动订阅索引——清壳后新注册仍推到旧订阅者，客户端无需重连。壳上 `lastUpdated` 只在实例变更时刷新（Java：`ServiceChangedEvent` → `Service.renewUpdateTime`，订阅不刷新）。
-12. **节点身份 = 内部同步地址**：raft ServerID = syncAddr（raft Address 仍是 raft 传输地址），raft 配置表天然即成员表——Join 重定向与 naming peer 拨号零发现协议。代价：固定端口即稳定身份，重启须保持 sync 端口不变（生产语义；旧 data/ 目录在身份语义变更前需重建）。
+12. **节点身份 = gRPC 地址**：raft ServerID = gRPC 绑定地址（raft Address 仍是 raft 传输地址），raft 配置表天然即成员表——Join 重定向与 naming peer 拨号零发现协议。代价：固定端口即稳定身份，重启须保持 gRPC 端口不变（生产语义；旧 data/ 目录在身份语义变更前需重建）。
 13. **防回环靠结构性隔离**：远端 apply 路径（ApplyRemote*/Reconcile/PurgeNode/RestoreSnapshot）永不 emit，无需 from_sync 标志；订阅索引仅本地，远端变更只触发常规本地推送。对账双守卫：只动 originNode=对端 的条目且 connID 匹配，本地 takeover 永不被远端声明覆盖。
 14. **FSM OnChange 钩子**：每节点 Apply 变更后各推本地监听者，3+ 节点 config watch 不漏、零额外 RPC；钩子在释放 FSM 锁后调用，防与 Listen 的锁序倒置。follower 读/订阅种子经 AppendEntries 异步追赶，属正常 raft 语义。
-15. **内部传输与 SDK 路径隔离**：hashicorp/raft 的 transport 只做共识（r-nacos 自带 raft 网络层可复用，我们不能），join/forward/naming 同步走独立 gRPC 端口（默认 9850），手写 ServiceDesc、复用 sweet/gen.Payload 信封 + JSON body；SDK 协议零改动。
+15. **内部传输复用 SDK gRPC 端口**：hashicorp/raft 的 transport 只做共识（r-nacos 自带 raft 网络层可复用，我们不能），join/forward/naming 同步是注册在 SDK gRPC server 上的独立 Cluster 服务（同端口 9848、不同 service，Java Nacos 的 server gRPC 同样多路复用），手写 ServiceDesc、复用 sweet/gen.Payload 信封 + JSON body；不另开端口，SDK 协议零改动。
+16. **端口对齐 Java Nacos**：以主端口 8848 为基准的官方偏移——gRPC +1000=9848（SDK 与节点间内部 RPC 复用）、raft -1000=7848；控制台 8080（Nacos 3.x 独立控制台端口，不偏移）。Java 的 +1001=9849 服务端 gRPC 端口在 go-nacos 里不需要（内部 RPC 已并入 9848）；go-nacos 无 1.x HTTP OpenAPI，故不监听 8848 本身。
 
 ## 里程碑
 
@@ -102,12 +104,15 @@ graph TD
 ```sh
 go mod tidy
 go build ./...
-go run ./cmd/gonacos -listen 127.0.0.1:9848 -raft-listen 127.0.0.1:9849 -sync-listen 127.0.0.1:9850 -admin-listen 127.0.0.1:8848 -data-dir ./data
-# 第二个节点：-join 指向任一存活节点的 sync 地址（空 = bootstrap 新集群）
-go run ./cmd/gonacos -listen 127.0.0.1:9858 -raft-listen 127.0.0.1:9859 -sync-listen 127.0.0.1:9860 -admin-listen 127.0.0.1:8858 -data-dir ./data2 -join 127.0.0.1:9850
+./run.sh                # 单机：gRPC 9848 / raft 7848 / 控制台 8080
+./run.sh cluster        # 本机 3 节点集群，每节点全部端口 +10（8080/8090/8100 ...）
+# 等价的手工启动：
+go run ./cmd/gonacos -data-dir ./data
+# 第二个节点：-join 指向任一存活节点的 gRPC 地址（空 = bootstrap 新集群）
+go run ./cmd/gonacos -listen 127.0.0.1:9858 -raft-listen 127.0.0.1:7858 -admin-listen 127.0.0.1:8090 -data-dir ./data2 -join 127.0.0.1:9848
 go test ./e2e -v
 ```
 
-观测台：http://127.0.0.1:8848（`-admin-listen off` 可禁用；读 + 有限写，暂不鉴权）。
+观测台：http://127.0.0.1:8080（`-admin-listen off` 可禁用；读 + 有限写，暂不鉴权）。
 
 sweet 依赖已发布的 `v1.0.1`（go.mod 无 replace，别人 clone go-nacos 后 `go test ./e2e` 即从代理拉取，无需同级 sweet）。本地开发用 gitignored 的 `go.work`（`use . ../sweet`）覆盖到本地源码；`GOWORK=off go test ./e2e` 可验证不依赖本地 sweet 的可移植路径。
