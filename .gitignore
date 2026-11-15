@@ -29,5 +29,8 @@ go.work.sum
 .env
 
 # Editor/IDE
-# .idea/
+.idea/
 # .vscode/
+
+# go-nacos runtime data (raft logs, snapshots, bbolt)
+data/
