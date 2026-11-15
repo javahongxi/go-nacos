@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -177,4 +179,54 @@ func (s *Service) removeConn(connID string) {
 			delete(s.listens, ks)
 		}
 	}
+}
+
+// Info is a read-only config summary for the admin console (content omitted).
+type Info struct {
+	DataID       string `json:"dataId"`
+	Group        string `json:"group"`
+	Tenant       string `json:"tenant"`
+	MD5          string `json:"md5"`
+	Type         string `json:"type,omitempty"`
+	AppName      string `json:"appName,omitempty"`
+	LastModified int64  `json:"lastModified"`
+}
+
+// List returns every config as a summary, ordered by key. Read-only.
+func (s *Service) List() []Info {
+	all := s.fsm.All()
+	out := make([]Info, 0, len(all))
+	for ks, it := range all {
+		k := parseKey(ks)
+		out = append(out, Info{
+			DataID: k.DataID, Group: k.Group, Tenant: k.Tenant,
+			MD5: it.MD5, Type: it.Type, AppName: it.AppName, LastModified: it.LastModified,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].DataID != out[j].DataID {
+			return out[i].DataID < out[j].DataID
+		}
+		if out[i].Group != out[j].Group {
+			return out[i].Group < out[j].Group
+		}
+		return out[i].Tenant < out[j].Tenant
+	})
+	return out
+}
+
+// parseKey reverses Key.String's \x00 joining.
+func parseKey(s string) Key {
+	p := strings.SplitN(s, "\x00", 3)
+	var k Key
+	if len(p) > 0 {
+		k.DataID = p[0]
+	}
+	if len(p) > 1 {
+		k.Group = p[1]
+	}
+	if len(p) > 2 {
+		k.Tenant = p[2]
+	}
+	return k
 }

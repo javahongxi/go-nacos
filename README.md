@@ -4,6 +4,7 @@ Nacos 的 Go 原生服务端实现，与官方 Nacos 2.x/3.x gRPC SDK 线级兼�
 
 - 配置中心：hashicorp/raft + bbolt 嵌入式存储
 - 命名服务：临时实例内存态，活性 = 连接
+- 只读观测台：独立 HTTP 端口（默认 8848），配置/服务/连接/raft 状态一览
 - 测试客户端：[sweet](https://github.com/javahongxi/sweet)（手写 Nacos 协议客户端）
 
 设计文档见 [doc/design.md](doc/design.md)。
@@ -14,10 +15,12 @@ Nacos 的 Go 原生服务端实现，与官方 Nacos 2.x/3.x gRPC SDK 线级兼�
 go run ./cmd/gonacos -listen 127.0.0.1:9848 -raft-listen 127.0.0.1:9849 -data-dir ./data
 ```
 
+只读观测台：http://127.0.0.1:8848（`-admin-listen off` 可禁用）。
+
 ## 测试
 
 ```sh
 go test ./e2e -v
 ```
 
-e2e 用 sweet 客户端驱动：config 生命周期 / CAS 冲突 / 重启持久化 / naming 订阅推送 / 断线重放。
+e2e 用 sweet 客户端驱动：config 生命周期 / CAS 冲突 / 重启持久化 / naming 订阅推送 / 断线重放 / 只读观测台。

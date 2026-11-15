@@ -226,3 +226,51 @@ func (s *Service) push(k Key) {
 		}(c)
 	}
 }
+
+// ServiceSummary is a read-only service row for the admin console.
+type ServiceSummary struct {
+	Namespace   string `json:"namespace"`
+	Group       string `json:"group"`
+	Name        string `json:"name"`
+	Instances   int    `json:"instances"`
+	Subscribers int    `json:"subscribers"`
+}
+
+// List returns every known service with instance/subscriber counts. Read-only.
+func (s *Service) List() []ServiceSummary {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]ServiceSummary, 0, len(s.services))
+	for _, st := range s.services {
+		out = append(out, ServiceSummary{
+			Namespace: st.key.Namespace, Group: st.key.Group, Name: st.key.Name,
+			Instances: len(st.instances), Subscribers: len(st.subscribers),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		if out[i].Group != out[j].Group {
+			return out[i].Group < out[j].Group
+		}
+		return out[i].Namespace < out[j].Namespace
+	})
+	return out
+}
+
+// Subscribers returns the connection ids subscribed to a service. Read-only.
+func (s *Service) Subscribers(k Key) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := s.services[k.String()]
+	if st == nil {
+		return nil
+	}
+	out := make([]string, 0, len(st.subscribers))
+	for id := range st.subscribers {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}

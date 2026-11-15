@@ -151,3 +151,14 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 }
 
 func (s *fsmSnapshot) Release() {}
+
+// All returns a copy of the full state for read-only inspection (admin).
+func (f *FSM) All() map[string]Item {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	out := make(map[string]Item, len(f.items))
+	for k, v := range f.items {
+		out[k] = v
+	}
+	return out
+}

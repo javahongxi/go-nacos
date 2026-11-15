@@ -5,9 +5,12 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,10 +21,11 @@ import (
 func newApp(t *testing.T, dir string) *app.App {
 	t.Helper()
 	a, err := app.New(app.Options{
-		GRPCListen: "127.0.0.1:0",
-		RaftListen: "127.0.0.1:0",
-		DataDir:    dir,
-		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		GRPCListen:  "127.0.0.1:0",
+		RaftListen:  "127.0.0.1:0",
+		AdminListen: "127.0.0.1:0",
+		DataDir:     dir,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
 		t.Fatalf("app.New: %v", err)
@@ -276,5 +280,148 @@ func waitHosts(t *testing.T, updates <-chan nacos.ServiceInfo, want int) {
 		case <-deadline:
 			t.Fatalf("timed out waiting for a push with %d hosts", want)
 		}
+	}
+}
+
+func TestAdminReadOnly(t *testing.T) {
+	a := newApp(t, t.TempDir())
+	cfg := newConfig(t, a.Addr())
+	provider := newNaming(t, a.Addr())
+	consumer := newNaming(t, a.Addr())
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	key := nacos.ConfigKey{DataID: "admin.yaml", Group: "DEFAULT_GROUP"}
+	if err := cfg.Publish(ctx, key, nacos.PublishInput{Content: "hello-admin", Type: "yaml"}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	const svc = "admin.Svc"
+	inst := nacos.Instance{IP: "127.0.0.1", Port: 21000, Weight: 1, Healthy: true, Enabled: true, Ephemeral: true}
+	if err := provider.Register(ctx, svc, inst); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if _, err := consumer.Subscribe(ctx, svc); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	base := "http://" + a.AdminAddr()
+
+	var ov struct {
+		Configs     int    `json:"configs"`
+		Services    int    `json:"services"`
+		Connections int    `json:"connections"`
+		RaftState   string `json:"raftState"`
+	}
+	adminGet(t, base+"/api/overview", &ov)
+	if ov.Configs < 1 || ov.Services < 1 || ov.Connections < 1 || ov.RaftState != "Leader" {
+		t.Fatalf("overview = %+v", ov)
+	}
+
+	var configs []struct {
+		DataID string `json:"dataId"`
+		MD5    string `json:"md5"`
+	}
+	adminGet(t, base+"/api/configs", &configs)
+	found := false
+	for _, c := range configs {
+		if c.DataID == "admin.yaml" && c.MD5 != "" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("configs missing admin.yaml: %+v", configs)
+	}
+
+	var detail struct {
+		Content string `json:"content"`
+		MD5     string `json:"md5"`
+	}
+	adminGet(t, base+"/api/config?dataId=admin.yaml&group=DEFAULT_GROUP&tenant=public", &detail)
+	if detail.Content != "hello-admin" || detail.MD5 == "" {
+		t.Fatalf("config detail = %+v", detail)
+	}
+
+	var services []struct {
+		Name        string `json:"name"`
+		Instances   int    `json:"instances"`
+		Subscribers int    `json:"subscribers"`
+	}
+	adminGet(t, base+"/api/services", &services)
+	found = false
+	for _, s := range services {
+		if s.Name == svc && s.Instances == 1 && s.Subscribers == 1 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("services missing %s with 1 instance/1 subscriber: %+v", svc, services)
+	}
+
+	var sd struct {
+		ServiceInfo struct {
+			Hosts []struct {
+				IP   string `json:"ip"`
+				Port int    `json:"port"`
+			} `json:"hosts"`
+		} `json:"serviceInfo"`
+		Subscribers []string `json:"subscribers"`
+	}
+	adminGet(t, base+"/api/service?name=admin.Svc&group=DEFAULT_GROUP&namespace=public", &sd)
+	if len(sd.ServiceInfo.Hosts) != 1 || sd.ServiceInfo.Hosts[0].Port != 21000 || len(sd.Subscribers) != 1 {
+		t.Fatalf("service detail = %+v", sd)
+	}
+
+	var conns []struct {
+		ID     string `json:"id"`
+		Module string `json:"module"`
+	}
+	adminGet(t, base+"/api/connections", &conns)
+	if len(conns) == 0 {
+		t.Fatal("connections empty")
+	}
+
+	var raftStatus struct {
+		State string            `json:"state"`
+		Stats map[string]string `json:"stats"`
+	}
+	adminGet(t, base+"/api/raft", &raftStatus)
+	if raftStatus.State != "Leader" || raftStatus.Stats["term"] == "" {
+		t.Fatalf("raft = %+v", raftStatus)
+	}
+
+	// The embedded frontend is served at /.
+	resp, err := http.Get(base + "/")
+	if err != nil {
+		t.Fatalf("GET /: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || !strings.Contains(string(body), "go-nacos console") {
+		t.Fatalf("frontend status=%d, body lacks title", resp.StatusCode)
+	}
+
+	// Read-only: a write method must be rejected with 405.
+	pr, err := http.Post(base+"/api/configs", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	pr.Body.Close()
+	if pr.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("POST /api/configs status=%d, want 405", pr.StatusCode)
+	}
+}
+
+func adminGet(t *testing.T, url string, out any) {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("GET %s status=%d", url, resp.StatusCode)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		t.Fatalf("decode %s: %v", url, err)
 	}
 }

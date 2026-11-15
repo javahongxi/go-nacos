@@ -7,6 +7,7 @@ package conn
 import (
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -148,6 +149,36 @@ func (r *Registry) GetByID(id string) *Connection {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.byID[id]
+}
+
+// ConnInfo is a read-only snapshot of a connection for the admin console.
+type ConnInfo struct {
+	ID       string `json:"id"`
+	Peer     string `json:"peer"`
+	ClientIP string `json:"clientIp"`
+	Version  string `json:"version"`
+	Module   string `json:"module"`
+	AppName  string `json:"appName"`
+}
+
+// List returns every live connection, ordered by peer then id. Read-only.
+func (r *Registry) List() []ConnInfo {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]ConnInfo, 0, len(r.byID))
+	for _, c := range r.byID {
+		out = append(out, ConnInfo{
+			ID: c.ID, Peer: c.Peer, ClientIP: c.Meta.ClientIP,
+			Version: c.Meta.Version, Module: c.Meta.Module, AppName: c.Meta.AppName,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Peer != out[j].Peer {
+			return out[i].Peer < out[j].Peer
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
 }
 
 // CloseAll retires every connection (server shutdown, or the e2e reconnect
