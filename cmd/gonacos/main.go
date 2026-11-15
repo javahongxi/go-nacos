@@ -14,6 +14,8 @@ func main() {
 	var opts app.Options
 	flag.StringVar(&opts.GRPCListen, "listen", "127.0.0.1:9848", "gRPC SDK listen address (Nacos convention: main port + 1000)")
 	flag.StringVar(&opts.RaftListen, "raft-listen", "127.0.0.1:9849", "raft transport listen address")
+	flag.StringVar(&opts.SyncListen, "sync-listen", "127.0.0.1:9850", "internal cluster sync listen address (also the node's cluster identity)")
+	flag.StringVar(&opts.JoinAddr, "join", "", "existing node's sync address to join (empty = bootstrap a new cluster)")
 	flag.StringVar(&opts.AdminListen, "admin-listen", "127.0.0.1:8848", "read-only console HTTP address (\"off\" disables)")
 	flag.StringVar(&opts.DataDir, "data-dir", "data", "data directory (raft logs, snapshots, bbolt)")
 	flag.Parse()
@@ -31,7 +33,7 @@ func main() {
 		a.Stop()
 		os.Exit(1)
 	}
-	logger.Info("go-nacos ready", "grpc", a.Addr(), "raft", opts.RaftListen, "admin", a.AdminAddr(), "dataDir", opts.DataDir)
+	logger.Info("go-nacos ready", "grpc", a.Addr(), "raft", opts.RaftListen, "sync", a.SyncAddr(), "join", opts.JoinAddr, "admin", a.AdminAddr(), "dataDir", opts.DataDir)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)

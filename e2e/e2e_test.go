@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -24,6 +25,7 @@ func newApp(t *testing.T, dir string, tune ...func(*app.Options)) *app.App {
 	opts := app.Options{
 		GRPCListen:  "127.0.0.1:0",
 		RaftListen:  "127.0.0.1:0",
+		SyncListen:  "127.0.0.1:0",
 		AdminListen: "127.0.0.1:0",
 		DataDir:     dir,
 		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -72,6 +74,19 @@ func waitReady(t *testing.T, c interface{ WaitReady(context.Context) error }) {
 	if err := c.WaitReady(ctx); err != nil {
 		t.Fatalf("WaitReady: %v", err)
 	}
+}
+
+// pinnedSyncListen reserves a free port so a restarted node can reuse the
+// same sync address (and thus the same cluster identity).
+func pinnedSyncListen(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve sync port: %v", err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+	return addr
 }
 
 func waitReconnect(t *testing.T, c interface {
@@ -149,7 +164,11 @@ func TestConfigLifecycle(t *testing.T) {
 
 func TestConfigPersistence(t *testing.T) {
 	dir := t.TempDir()
-	a := newApp(t, dir)
+	// Node identity IS the sync address, so a restart keeps it only on a
+	// fixed port — exactly the production setup.
+	syncAddr := pinnedSyncListen(t)
+	pin := func(o *app.Options) { o.SyncListen = syncAddr }
+	a := newApp(t, dir, pin)
 	c := newConfig(t, a.Addr())
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -161,7 +180,7 @@ func TestConfigPersistence(t *testing.T) {
 	c.Close()
 	a.Stop()
 
-	a2 := newApp(t, dir)
+	a2 := newApp(t, dir, pin)
 	c2 := newConfig(t, a2.Addr())
 	got, err := c2.Query(ctx, key)
 	if err != nil {

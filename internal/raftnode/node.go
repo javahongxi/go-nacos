@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"time"
@@ -21,22 +20,44 @@ type Node struct {
 	Raft      *raft.Raft
 	transport *raft.NetworkTransport
 	logs      *raftboltdb.BoltStore
+	nodeID    string
 }
 
-func New(dataDir, listen string, fsm raft.FSM) (*Node, error) {
+// Option tunes a Node at construction.
+type Option func(*options)
+
+type options struct {
+	nodeID string
+	join   bool
+}
+
+// WithNodeID sets the raft ServerID. go-nacos identifies a node by its
+// internal sync address, so the raft configuration doubles as the cluster
+// member table: ID = sync address (dialable), Address = raft transport.
+func WithNodeID(id string) Option { return func(o *options) { o.nodeID = id } }
+
+// WithJoin skips bootstrap on a fresh node: an existing leader AddVoters us
+// instead (the app drives the join handshake over the internal transport).
+func WithJoin() Option { return func(o *options) { o.join = true } }
+
+func New(dataDir, listen string, fsm raft.FSM, opts ...Option) (*Node, error) {
+	var o options
+	for _, f := range opts {
+		f(&o)
+	}
 	cfg := raft.DefaultConfig()
 	cfg.Logger = hclog.New(&hclog.LoggerOptions{Name: "gonacos-raft", Level: hclog.Warn, Output: os.Stderr})
 
-	addr, err := net.ResolveTCPAddr("tcp", listen)
-	if err != nil {
-		return nil, fmt.Errorf("raftnode: resolve %s: %w", listen, err)
-	}
-	transport, err := raft.NewTCPTransport(listen, addr, 3, 10*time.Second, io.Discard)
+	// nil advertise: the transport reports the actually-bound address, so a
+	// :0 listen works in tests and cluster members get dialable addresses.
+	transport, err := raft.NewTCPTransport(listen, nil, 3, 10*time.Second, io.Discard)
 	if err != nil {
 		return nil, fmt.Errorf("raftnode: transport: %w", err)
 	}
-	// Advertise the actually-bound address, so a :0 listen works in tests.
 	cfg.LocalID = raft.ServerID(transport.LocalAddr())
+	if o.nodeID != "" {
+		cfg.LocalID = raft.ServerID(o.nodeID)
+	}
 
 	logs, err := raftboltdb.NewBoltStore(filepath.Join(dataDir, "raft.db"))
 	if err != nil {
@@ -62,7 +83,7 @@ func New(dataDir, listen string, fsm raft.FSM) (*Node, error) {
 		transport.Close()
 		return nil, fmt.Errorf("raftnode: new raft: %w", err)
 	}
-	if !hasState {
+	if !hasState && !o.join {
 		f := r.BootstrapCluster(raft.Configuration{Servers: []raft.Server{{
 			ID:      cfg.LocalID,
 			Address: transport.LocalAddr(),
@@ -74,16 +95,33 @@ func New(dataDir, listen string, fsm raft.FSM) (*Node, error) {
 			return nil, fmt.Errorf("raftnode: bootstrap: %w", err)
 		}
 	}
-	return &Node{Raft: r, transport: transport, logs: logs}, nil
+	return &Node{Raft: r, transport: transport, logs: logs, nodeID: string(cfg.LocalID)}, nil
 }
 
-// WaitLeader blocks until this node is leader (single node: after the first
-// election, ~1s) or ctx ends. Callers publish right after Start returns.
+// NodeID is this node's cluster identity (its internal sync address).
+func (n *Node) NodeID() string { return n.nodeID }
+
+// RaftAddr is the bound raft transport address (meaningful with a :0 listen).
+func (n *Node) RaftAddr() string { return string(n.transport.LocalAddr()) }
+
+// Voters lists the current raft configuration — the cluster member table the
+// naming sync module builds on. ID is the member's sync address.
+func (n *Node) Voters() []raft.Server {
+	f := n.Raft.GetConfiguration()
+	if err := f.Error(); err != nil {
+		return nil
+	}
+	return f.Configuration().Servers
+}
+
+// WaitLeader blocks until the cluster has a leader — this node right after
+// bootstrap, any voter for a joiner — or ctx ends. Callers publish right
+// after Start returns.
 func (n *Node) WaitLeader(ctx context.Context) error {
 	tick := time.NewTicker(20 * time.Millisecond)
 	defer tick.Stop()
 	for {
-		if n.Raft.State() == raft.Leader {
+		if n.Raft.Leader() != "" {
 			return nil
 		}
 		select {

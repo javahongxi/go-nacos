@@ -40,9 +40,10 @@ type ApplyResult struct {
 // FSM is the replicated config state: an in-memory map for reads, backed by
 // synchronous bbolt writes. raft owns ordering; the FSM owns the data.
 type FSM struct {
-	mu    sync.RWMutex
-	items map[string]Item
-	store *Store
+	mu       sync.RWMutex
+	items    map[string]Item
+	store    *Store
+	onChange func(key string)
 }
 
 func NewFSM(store *Store) (*FSM, error) {
@@ -51,6 +52,15 @@ func NewFSM(store *Store) (*FSM, error) {
 		return nil, err
 	}
 	return &FSM{items: items, store: store}, nil
+}
+
+// NotifyOnChange installs the change hook: every applied write that changed
+// state calls it with the key — on EVERY node, so each notifies its own
+// listeners (cluster-wide config push with no extra RPCs).
+func (f *FSM) NotifyOnChange(fn func(key string)) {
+	f.mu.Lock()
+	f.onChange = fn
+	f.mu.Unlock()
 }
 
 func (f *FSM) Get(key string) (Item, bool) {
@@ -66,13 +76,24 @@ func (f *FSM) Apply(l *raft.Log) any {
 		return ApplyResult{Message: fmt.Sprintf("config: undecodable command: %v", err)}
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	res, changedKey := f.applyLocked(cmd)
+	hook := f.onChange
+	f.mu.Unlock()
+	// Outside the lock: the hook takes the Service's listen lock, and Listen
+	// holds that lock while reading the FSM — calling back inside would
+	// invert the order.
+	if changedKey != "" && hook != nil {
+		hook(changedKey)
+	}
+	return res
+}
 
+func (f *FSM) applyLocked(cmd Command) (ApplyResult, string) {
 	switch cmd.Op {
 	case "publish":
 		cur, exists := f.items[cmd.Key]
 		if cmd.CasMD5 != "" && exists && cur.MD5 != cmd.CasMD5 {
-			return ApplyResult{Conflict: true, Message: CasConflictMessage}
+			return ApplyResult{Conflict: true, Message: CasConflictMessage}, ""
 		}
 		// A CAS publish on a missing key creates it (Nacos AbstractCAS).
 		newMD5 := md5Hex(cmd.Content)
@@ -84,26 +105,29 @@ func (f *FSM) Apply(l *raft.Log) any {
 			LastModified: cmd.Now,
 		}
 		if err := f.store.Put(cmd.Key, it); err != nil {
-			return ApplyResult{Message: fmt.Sprintf("config: store put: %v", err)}
+			return ApplyResult{Message: fmt.Sprintf("config: store put: %v", err)}, ""
 		}
 		changed := !exists || cur.MD5 != newMD5
 		f.items[cmd.Key] = it
-		return ApplyResult{OK: true, Changed: changed}
+		if changed {
+			return ApplyResult{OK: true, Changed: true}, cmd.Key
+		}
+		return ApplyResult{OK: true}, ""
 
 	case "remove":
 		if _, exists := f.items[cmd.Key]; !exists {
 			// Idempotent, and still a change event: Nacos fires on remove
 			// regardless, so watchers of an absent key learn it stays absent.
-			return ApplyResult{OK: true, Changed: true}
+			return ApplyResult{OK: true, Changed: true}, cmd.Key
 		}
 		if err := f.store.Delete(cmd.Key); err != nil {
-			return ApplyResult{Message: fmt.Sprintf("config: store delete: %v", err)}
+			return ApplyResult{Message: fmt.Sprintf("config: store delete: %v", err)}, ""
 		}
 		delete(f.items, cmd.Key)
-		return ApplyResult{OK: true, Changed: true}
+		return ApplyResult{OK: true, Changed: true}, cmd.Key
 
 	default:
-		return ApplyResult{Message: fmt.Sprintf("config: unknown op %q", cmd.Op)}
+		return ApplyResult{Message: fmt.Sprintf("config: unknown op %q", cmd.Op)}, ""
 	}
 }
 
