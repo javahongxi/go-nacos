@@ -15,7 +15,7 @@ Nacos 的 Go 原生服务端实现，与官方 Nacos 2.x/3.x gRPC SDK 线级兼�
 go run ./cmd/gonacos -listen 127.0.0.1:9848 -raft-listen 127.0.0.1:9849 -data-dir ./data
 ```
 
-管理台：http://127.0.0.1:8848（`-admin-listen off` 可禁用；暂不鉴权，默认仅回环监听）。
+管理台：`http://127.0.0.1:8848`（`-admin-listen off` 可禁用；暂不鉴权，默认仅回环监听）。
 
 ## 测试
 
