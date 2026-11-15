@@ -113,6 +113,6 @@ go run ./cmd/gonacos -listen 127.0.0.1:9858 -raft-listen 127.0.0.1:7858 -admin-l
 go test ./e2e -v
 ```
 
-观测台：http://127.0.0.1:8080（`-admin-listen off` 可禁用；读 + 有限写，暂不鉴权）。
+观测台：`http://127.0.0.1:8080`（`-admin-listen off` 可禁用；读 + 有限写，暂不鉴权）。
 
 sweet 依赖已发布的 `v1.0.1`（go.mod 无 replace，别人 clone go-nacos 后 `go test ./e2e` 即从代理拉取，无需同级 sweet）。本地开发用 gitignored 的 `go.work`（`use . ../sweet`）覆盖到本地源码；`GOWORK=off go test ./e2e` 可验证不依赖本地 sweet 的可移植路径。
