@@ -50,6 +50,7 @@ func New(cfg *config.Service, naming *naming.Service, conns *conn.Registry, node
 	mux.HandleFunc("GET /api/overview", s.overview)
 	mux.HandleFunc("GET /api/configs", s.configs)
 	mux.HandleFunc("GET /api/config", s.configDetail)
+	mux.HandleFunc("GET /api/config/history", s.configHistory)
 	mux.HandleFunc("GET /api/services", s.services)
 	mux.HandleFunc("GET /api/service", s.serviceDetail)
 	mux.HandleFunc("GET /api/connections", s.connections)
@@ -110,6 +111,29 @@ func (s *Server) configDetail(w http.ResponseWriter, r *http.Request) {
 		"dataId": k.DataID, "group": k.Group, "tenant": k.Tenant,
 		"content": it.Content, "md5": it.MD5, "type": it.Type,
 		"appName": it.AppName, "lastModified": it.LastModified,
+	})
+}
+
+// configHistory lists the retained versions of one config, newest first
+// (the FSM keeps up to 100 including the current one, r-nacos style).
+func (s *Server) configHistory(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	k := config.Key{
+		DataID: q.Get("dataId"),
+		Group:  orDefault(q.Get("group"), "DEFAULT_GROUP"),
+		Tenant: orDefault(q.Get("tenant"), "public"),
+	}
+	if _, ok := s.cfg.Query(k); !ok {
+		http.Error(w, "config not found", http.StatusNotFound)
+		return
+	}
+	hist := s.cfg.History(k)
+	for i, j := 0, len(hist)-1; i < j; i, j = i+1, j-1 {
+		hist[i], hist[j] = hist[j], hist[i]
+	}
+	writeJSON(w, map[string]any{
+		"dataId": k.DataID, "group": k.Group, "tenant": k.Tenant,
+		"total": len(hist), "history": hist,
 	})
 }
 

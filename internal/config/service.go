@@ -4,9 +4,6 @@
 package config
 
 import (
-	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -14,9 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hashicorp/raft"
-
 	"github.com/javahongxi/go-nacos/internal/conn"
+	"github.com/javahongxi/go-nacos/internal/fsm"
 	"github.com/javahongxi/go-nacos/internal/wire"
 )
 
@@ -29,47 +25,40 @@ type Key struct {
 
 func (k Key) String() string { return k.DataID + "\x00" + k.Group + "\x00" + k.Tenant }
 
-const applyTimeout = 5 * time.Second
-
-// Forwarder carries a write to the leader's internal address (implemented by
-// cluster.Client). nil means single-node: a non-leader write simply fails.
-type Forwarder interface {
-	Forward(ctx context.Context, leaderAddr string, data []byte) ([]byte, error)
-}
-
 // Service owns the listen table: groupKey → connID → last md5 the client
 // holds. Writes are replicated; listens are connection-local (a reconnect
 // re-listens, so they need no replication). Change notifications fire from
 // the FSM hook on every node, each pushing to its own listeners.
 type Service struct {
-	r      *raft.Raft
+	w      *fsm.Writer
 	fsm    *FSM
 	conns  *conn.Registry
-	fwd    Forwarder
 	logger *slog.Logger
 
 	mu      sync.Mutex
 	listens map[string]map[string]string
 }
 
-func NewService(r *raft.Raft, fsm *FSM, conns *conn.Registry, logger *slog.Logger, fwd Forwarder) *Service {
+func NewService(w *fsm.Writer, state *FSM, conns *conn.Registry, logger *slog.Logger) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	s := &Service{
-		r:       r,
-		fsm:     fsm,
+		w:       w,
+		fsm:     state,
 		conns:   conns,
-		fwd:     fwd,
 		logger:  logger,
 		listens: map[string]map[string]string{},
 	}
-	fsm.NotifyOnChange(func(ks string) { s.notify(parseKey(ks)) })
+	state.NotifyOnChange(func(ks string) { s.notify(parseKey(ks)) })
 	conns.OnClose(s.removeConn)
 	return s
 }
 
 func (s *Service) Query(k Key) (Item, bool) { return s.fsm.Get(k.String()) }
+
+// History returns the key's retained versions, oldest first (admin console).
+func (s *Service) History(k Key) []HistoryItem { return s.fsm.History(k.String()) }
 
 // Publish replicates a write; the FSM change hook notifies listeners on
 // every node when the content changed.
@@ -91,72 +80,14 @@ func (s *Service) Remove(k Key) ApplyResult {
 	return s.apply(Command{Op: "remove", Key: k.String(), Now: time.Now().UnixMilli()})
 }
 
-// apply runs a write locally on the leader, or forwards the original command
-// bytes to the leader from a follower (the SDK has no redirect semantics).
+// apply runs a write through the shared raft path: locally on the leader,
+// forwarded to the leader from a follower (the SDK has no redirect semantics).
 func (s *Service) apply(cmd Command) ApplyResult {
-	data, err := json.Marshal(cmd)
+	res, err := fsm.Apply[ApplyResult](s.w, fsm.DomainConfig, cmd)
 	if err != nil {
-		return ApplyResult{Message: err.Error()}
-	}
-	if s.r.State() != raft.Leader {
-		return s.forward(data)
-	}
-	res, err := s.applyRaft(data)
-	if errors.Is(err, raft.ErrNotLeader) {
-		return s.forward(data) // lost leadership mid-apply
-	}
-	if err != nil {
-		return ApplyResult{Message: fmt.Sprintf("config: raft apply: %v", err)}
+		return ApplyResult{Message: fmt.Sprintf("config: %v", err)}
 	}
 	return res
-}
-
-func (s *Service) applyRaft(data []byte) (ApplyResult, error) {
-	f := s.r.Apply(data, applyTimeout)
-	if err := f.Error(); err != nil {
-		return ApplyResult{}, err
-	}
-	res, ok := f.Response().(ApplyResult)
-	if !ok {
-		return ApplyResult{}, errors.New("config: unexpected apply response")
-	}
-	return res, nil
-}
-
-func (s *Service) forward(data []byte) ApplyResult {
-	if s.fwd == nil {
-		return ApplyResult{Message: "config: not the leader"}
-	}
-	_, leaderID := s.r.LeaderWithID()
-	if leaderID == "" {
-		return ApplyResult{Message: "config: no leader"}
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), applyTimeout)
-	defer cancel()
-	out, err := s.fwd.Forward(ctx, string(leaderID), data)
-	if err != nil {
-		return ApplyResult{Message: fmt.Sprintf("config: forward to leader: %v", err)}
-	}
-	var res ApplyResult
-	if err := json.Unmarshal(out, &res); err != nil {
-		return ApplyResult{Message: fmt.Sprintf("config: decode forward result: %v", err)}
-	}
-	return res
-}
-
-// ApplyForwarded is the leader side of a forwarded write: apply the original
-// command bytes as-is (the origin already stamped Now) and answer with the
-// result. Every node's FSM hook notifies its own listeners, so the leader
-// needs no extra fan-out.
-func (s *Service) ApplyForwarded(data []byte) ([]byte, error) {
-	if s.r.State() != raft.Leader {
-		return nil, errors.New("config: not the leader")
-	}
-	res, err := s.applyRaft(data)
-	if err != nil {
-		return nil, err
-	}
-	return json.Marshal(res)
 }
 
 // Listen registers (or drops) a batch of watched keys for one connection and

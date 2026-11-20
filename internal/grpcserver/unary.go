@@ -99,6 +99,16 @@ func (s *Server) handleUnary(ctx context.Context, p *gen.Payload) (*gen.Payload,
 		if err := wire.Decode(p, &req); err != nil {
 			return badPayload(err)
 		}
+		// Java's Instance pojo defaults ephemeral=true, so a missing JSON
+		// field must not silently create a persistent (raft-backed) instance.
+		var probe struct {
+			Instance struct {
+				Ephemeral *bool `json:"ephemeral"`
+			} `json:"instance"`
+		}
+		if err := wire.Decode(p, &probe); err == nil && probe.Instance.Ephemeral == nil {
+			req.Instance.Ephemeral = true
+		}
 		k := namingKey(req.Namespace, req.GroupName, req.ServiceName)
 		var resp wire.Response
 		switch req.Type {

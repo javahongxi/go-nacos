@@ -5,16 +5,39 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"sync"
-
-	"github.com/hashicorp/raft"
 )
 
 // CasConflictMessage is the exact sentence Nacos produces when a casMd5 no
 // longer matches (ConfigOperationService:145-147). It travels with
 // resultCode=500/errorCode=500 — the message is the only conflict signal.
 const CasConflictMessage = "Cas publish fail, server md5 may have changed."
+
+// maxHistory caps the per-key version list (r-nacos ConfigValue.update_value:
+// drop the oldest once 100 is reached). History lives in the FSM and rides
+// the raft snapshot — there is no side database.
+const maxHistory = 100
+
+// Item is one stored config. MD5 is derived from Content at write time.
+// History holds every retained version INCLUDING the current one, oldest
+// first (r-nacos histories semantics); removing a config drops its history.
+type Item struct {
+	Content      string        `json:"content"`
+	MD5          string        `json:"md5"`
+	Type         string        `json:"type,omitempty"`
+	AppName      string        `json:"appName,omitempty"`
+	LastModified int64         `json:"lastModified"`
+	History      []HistoryItem `json:"history,omitempty"`
+}
+
+// HistoryItem is one retained version of a config.
+type HistoryItem struct {
+	Content      string `json:"content"`
+	MD5          string `json:"md5"`
+	Type         string `json:"type,omitempty"`
+	AppName      string `json:"appName,omitempty"`
+	LastModified int64  `json:"lastModified"`
+}
 
 // Command is one replicated config write. The leader stamps Now so every
 // replica applies identical bytes; CAS is evaluated inside Apply so the
@@ -37,21 +60,19 @@ type ApplyResult struct {
 	Message  string
 }
 
-// FSM is the replicated config state: an in-memory map for reads, backed by
-// synchronous bbolt writes. raft owns ordering; the FSM owns the data.
+// FSM is the replicated config state: an in-memory map, durable through raft
+// log replay and snapshots alone (r-nacos / jaws-harbor shape — the bbolt
+// side copy is gone). raft owns ordering; the FSM owns the data.
 type FSM struct {
 	mu       sync.RWMutex
 	items    map[string]Item
-	store    *Store
 	onChange func(key string)
 }
 
-func NewFSM(store *Store) (*FSM, error) {
-	items, err := store.LoadAll()
-	if err != nil {
-		return nil, err
-	}
-	return &FSM{items: items, store: store}, nil
+// NewFSM starts empty: startup recovery is raft's snapshot restore plus log
+// replay, not a local load.
+func NewFSM() *FSM {
+	return &FSM{items: map[string]Item{}}
 }
 
 // NotifyOnChange installs the change hook: every applied write that changed
@@ -70,9 +91,17 @@ func (f *FSM) Get(key string) (Item, bool) {
 	return it, ok
 }
 
-func (f *FSM) Apply(l *raft.Log) any {
+// History returns a copy of the key's retained versions, oldest first.
+func (f *FSM) History(key string) []HistoryItem {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return append([]HistoryItem(nil), f.items[key].History...)
+}
+
+// ApplyData implements fsm.Domain: one decoded config command.
+func (f *FSM) ApplyData(data []byte) any {
 	var cmd Command
-	if err := json.Unmarshal(l.Data, &cmd); err != nil {
+	if err := json.Unmarshal(data, &cmd); err != nil {
 		return ApplyResult{Message: fmt.Sprintf("config: undecodable command: %v", err)}
 	}
 	f.mu.Lock()
@@ -103,11 +132,19 @@ func (f *FSM) applyLocked(cmd Command) (ApplyResult, string) {
 			Type:         cmd.Type,
 			AppName:      cmd.AppName,
 			LastModified: cmd.Now,
-		}
-		if err := f.store.Put(cmd.Key, it); err != nil {
-			return ApplyResult{Message: fmt.Sprintf("config: store put: %v", err)}, ""
+			History:      cur.History,
 		}
 		changed := !exists || cur.MD5 != newMD5
+		if changed {
+			// Every retained version including the current one; an unchanged
+			// republish adds no history (r-nacos returns early on equal md5).
+			it.History = append(it.History, HistoryItem{
+				Content: cmd.Content, MD5: newMD5, Type: cmd.Type, AppName: cmd.AppName, LastModified: cmd.Now,
+			})
+			if len(it.History) > maxHistory {
+				it.History = it.History[len(it.History)-maxHistory:]
+			}
+		}
 		f.items[cmd.Key] = it
 		if changed {
 			return ApplyResult{OK: true, Changed: true}, cmd.Key
@@ -120,10 +157,7 @@ func (f *FSM) applyLocked(cmd Command) (ApplyResult, string) {
 			// regardless, so watchers of an absent key learn it stays absent.
 			return ApplyResult{OK: true, Changed: true}, cmd.Key
 		}
-		if err := f.store.Delete(cmd.Key); err != nil {
-			return ApplyResult{Message: fmt.Sprintf("config: store delete: %v", err)}, ""
-		}
-		delete(f.items, cmd.Key)
+		delete(f.items, cmd.Key) // history goes with the config
 		return ApplyResult{OK: true, Changed: true}, cmd.Key
 
 	default:
@@ -131,23 +165,22 @@ func (f *FSM) applyLocked(cmd Command) (ApplyResult, string) {
 	}
 }
 
-func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
+// SnapshotData implements fsm.Domain: a copy of the full state (history
+// included) for the composite raft snapshot.
+func (f *FSM) SnapshotData() any {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	items := make(map[string]Item, len(f.items))
 	for k, v := range f.items {
 		items[k] = v
 	}
-	return &fsmSnapshot{items: items}, nil
+	return items
 }
 
-func (f *FSM) Restore(rc io.ReadCloser) error {
-	defer rc.Close()
+// RestoreData implements fsm.Domain: swap in the snapshot state.
+func (f *FSM) RestoreData(data []byte) error {
 	var items map[string]Item
-	if err := json.NewDecoder(rc).Decode(&items); err != nil {
-		return err
-	}
-	if err := f.store.ReplaceAll(items); err != nil {
+	if err := json.Unmarshal(data, &items); err != nil {
 		return err
 	}
 	f.mu.Lock()
@@ -160,21 +193,6 @@ func md5Hex(s string) string {
 	sum := md5.Sum([]byte(s))
 	return hex.EncodeToString(sum[:])
 }
-
-type fsmSnapshot struct {
-	items map[string]Item
-}
-
-func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
-	err := json.NewEncoder(sink).Encode(s.items)
-	if err != nil {
-		sink.Cancel()
-		return err
-	}
-	return sink.Close()
-}
-
-func (s *fsmSnapshot) Release() {}
 
 // All returns a copy of the full state for read-only inspection (admin).
 func (f *FSM) All() map[string]Item {

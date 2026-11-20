@@ -1,5 +1,6 @@
-// Package app assembles the server: stores, raft, connection registry, domain
-// services, gRPC. Both cmd/gonacos and the e2e tests build through here.
+// Package app assembles the server: the composite raft FSM, connection
+// registry, domain services, gRPC. Both cmd/gonacos and the e2e tests build
+// through here.
 package app
 
 import (
@@ -8,7 +9,6 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -16,6 +16,7 @@ import (
 	"github.com/javahongxi/go-nacos/internal/cluster"
 	"github.com/javahongxi/go-nacos/internal/config"
 	"github.com/javahongxi/go-nacos/internal/conn"
+	"github.com/javahongxi/go-nacos/internal/fsm"
 	"github.com/javahongxi/go-nacos/internal/grpcserver"
 	"github.com/javahongxi/go-nacos/internal/naming"
 	nsync "github.com/javahongxi/go-nacos/internal/naming/sync"
@@ -32,6 +33,9 @@ type Options struct {
 
 	NamingCleanExpire   time.Duration // empty-service expiry, zero = 60s (Java default)
 	NamingCleanInterval time.Duration // empty-service scan interval, zero = 60s
+
+	NamingProbeInterval time.Duration // persistent-instance probe cadence, zero = 60s (r-nacos default)
+	NamingProbeTimeout  time.Duration // persistent-instance probe dial timeout, zero = 1s
 }
 
 type App struct {
@@ -44,9 +48,9 @@ type App struct {
 	Cluster *cluster.Server
 	Sync    *nsync.Manager
 
-	store         *config.Store
 	lis           net.Listener
 	clusterClient *cluster.Client
+	writer        *fsm.Writer
 	nodeID        string
 	joinAddr      string
 	logger        *slog.Logger
@@ -83,33 +87,32 @@ func New(opts Options) (*App, error) {
 	}
 	nodeID := lis.Addr().String()
 
-	store, err := config.OpenStore(filepath.Join(opts.DataDir, "config.db"))
-	if err != nil {
-		lis.Close()
-		return nil, err
-	}
-	fsm, err := config.NewFSM(store)
-	if err != nil {
-		store.Close()
-		lis.Close()
-		return nil, err
-	}
+	conns := conn.NewRegistry(nodeID, opts.Logger)
+	clusterClient := cluster.NewClient(opts.Logger)
+	// One raft group, two CP domains: config writes and naming persistent
+	// instances. Durability is raft's log+snapshot alone — no side database.
+	state := config.NewFSM()
+	namingSvc := naming.NewService(conns, opts.Logger,
+		naming.WithCleanerTiming(opts.NamingCleanExpire, opts.NamingCleanInterval),
+		naming.WithProbeTiming(opts.NamingProbeInterval, opts.NamingProbeTimeout),
+		naming.WithNodeID(nodeID))
+	router := fsm.NewRouter(map[string]fsm.Domain{
+		fsm.DomainConfig: state,
+		fsm.DomainNaming: namingSvc,
+	})
 	raftOpts := []raftnode.Option{raftnode.WithNodeID(nodeID)}
 	if opts.JoinAddr != "" {
 		raftOpts = append(raftOpts, raftnode.WithJoin())
 	}
-	node, err := raftnode.New(opts.DataDir, opts.RaftListen, fsm, raftOpts...)
+	node, err := raftnode.New(opts.DataDir, opts.RaftListen, router, raftOpts...)
 	if err != nil {
-		store.Close()
 		lis.Close()
+		clusterClient.Close()
 		return nil, err
 	}
-	conns := conn.NewRegistry(nodeID, opts.Logger)
-	clusterClient := cluster.NewClient(opts.Logger)
-	cfg := config.NewService(node.Raft, fsm, conns, opts.Logger, clusterClient)
-	namingSvc := naming.NewService(conns, opts.Logger,
-		naming.WithCleanerTiming(opts.NamingCleanExpire, opts.NamingCleanInterval),
-		naming.WithNodeID(nodeID))
+	writer := fsm.NewWriter(node.Raft, clusterClient)
+	cfg := config.NewService(writer, state, conns, opts.Logger)
+	namingSvc.SetRaftWriter(writer)
 	// The raft member table is the peer list: ServerID IS the gRPC address.
 	peers := func() []string {
 		servers := node.Voters()
@@ -121,7 +124,7 @@ func New(opts Options) (*App, error) {
 	}
 	syncMgr := nsync.New(nodeID, namingSvc, clusterClient, peers, opts.Logger)
 	namingSvc.SetEmitter(syncMgr)
-	clusterSrv := cluster.NewServer(node, cfg, syncMgr, opts.Logger)
+	clusterSrv := cluster.NewServer(node, writer, syncMgr, opts.Logger)
 	srv := grpcserver.New(conns, cfg, namingSvc, opts.Logger)
 	clusterSrv.Register(srv.Raw())
 
@@ -130,7 +133,6 @@ func New(opts Options) (*App, error) {
 		adminLis, err := net.Listen("tcp", opts.AdminListen)
 		if err != nil {
 			node.Close()
-			store.Close()
 			lis.Close()
 			clusterClient.Close()
 			return nil, fmt.Errorf("app: admin listen %s: %w", opts.AdminListen, err)
@@ -139,7 +141,7 @@ func New(opts Options) (*App, error) {
 	}
 	return &App{
 		Conns: conns, Config: cfg, Naming: namingSvc, Raft: node, GRPC: srv, Admin: adminSrv, Cluster: clusterSrv, Sync: syncMgr,
-		store: store, lis: lis, clusterClient: clusterClient, nodeID: nodeID, joinAddr: opts.JoinAddr,
+		lis: lis, clusterClient: clusterClient, writer: writer, nodeID: nodeID, joinAddr: opts.JoinAddr,
 		logger: opts.Logger, done: make(chan struct{}),
 	}, nil
 }
@@ -160,9 +162,10 @@ func (a *App) AdminAddr() string {
 // being removed from the raft cluster.
 func (a *App) Done() <-chan struct{} { return a.done }
 
-// Start serves in the background, joins the cluster when configured, and
-// waits until raft has a leader, so a caller can publish immediately after
-// it returns.
+// Start serves in the background, joins the cluster when configured, waits
+// until raft has a leader, then barriers the FSM so the tail log after the
+// last snapshot is replayed — a caller can read and publish immediately
+// after it returns, even on a restarted node.
 func (a *App) Start() error {
 	go func() { _ = a.GRPC.Serve(a.lis) }()
 	if a.Admin != nil {
@@ -177,6 +180,9 @@ func (a *App) Start() error {
 	}
 	if err := a.Raft.WaitLeader(ctx); err != nil {
 		return err
+	}
+	if err := a.writer.Barrier(ctx); err != nil {
+		return fmt.Errorf("app: fsm barrier: %w", err)
 	}
 	a.Sync.Start()
 	go a.watchMembership()
@@ -262,7 +268,6 @@ func (a *App) shutdown(hard bool) {
 		a.Admin.Close()
 	}
 	_ = a.Raft.Close()
-	_ = a.store.Close()
 	a.clusterClient.Close()
 	close(a.done)
 }

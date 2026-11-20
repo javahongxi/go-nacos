@@ -2,8 +2,8 @@
 
 Nacos 的 Go 原生服务端实现，与官方 Nacos 2.x/3.x gRPC SDK 线级兼容，用于学习研究。
 
-- 命名服务：临时实例内存态，活性 = 连接
-- 配置中心：hashicorp/raft + bbolt 嵌入式存储
+- 命名服务：临时实例内存态，活性 = 连接；持久实例过 raft + 服务端 TCP 健康探测（对齐 r-nacos）
+- 配置中心：hashicorp/raft 纯日志+快照存储（无额外数据文件），配置历史随快照持久化
 - 管理台：独立 HTTP 端口（默认 8080，对齐 Nacos 3.x），配置/服务/连接/raft 一览 + 配置发布/编辑/删除、实例下线、删除空服务 + 集群缩容
 - 测试客户端：[sweet](https://github.com/javahongxi/sweet)（手写 Nacos 协议客户端）
 
@@ -33,4 +33,4 @@ go run ./cmd/gonacos -data-dir ./data
 go test ./e2e -v
 ```
 
-e2e 用 sweet 客户端驱动：config 生命周期 / CAS 冲突 / 重启持久化 / naming 订阅推送 / 断线重放 / 管理台读写。
+e2e 用 sweet 客户端驱动：config 生命周期 / CAS 冲突 / 重启持久化 / 配置历史 / naming 订阅推送 / 断线重放 / 持久实例存活与健康探测 / 管理台读写。

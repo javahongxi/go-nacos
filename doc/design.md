@@ -2,11 +2,11 @@
 
 ## 定位
 
-go-nacos 是 Nacos 的 Go 原生实现：一个与官方 Nacos 2.x/3.x gRPC SDK 线级兼容的服务端，配置中心基于 raft + 嵌入式存储。项目用于学习研究，以官方 SDK 协议兼容为准绳，以 raft 保证配置的一致性持久性。
+go-nacos 是 Nacos 的 Go 原生实现：一个与官方 Nacos 2.x/3.x gRPC SDK 线级兼容的服务端，配置中心基于 raft 纯日志+快照存储。项目用于学习研究，以官方 SDK 协议兼容为准绳，以 raft 保证配置的一致性持久性。
 
-- **不做** 1.x HTTP OpenAPI、鉴权、持久实例、1.x UDP 推送；控制台为自建观测台（`internal/admin`，读 + 有限写），不复用 Java/r-nacos 的 HTTP 管理面。
-- **配置中心**：hashicorp/raft + 嵌入式存储（bbolt），写路径全部过 raft，M1 单节点即具备完整复制/快照/恢复骨架，M2 补齐 join/leader 路由与全节点变更通知。
-- **命名服务**：临时实例内存态，活性 = 连接（gRPC 模型无 beat），不过 raft；跨节点同步为连接级 AP（`internal/naming/sync`，与 r-nacos 同构）。
+- **不做** 1.x HTTP OpenAPI、鉴权、1.x UDP 推送；控制台为自建观测台（`internal/admin`，读 + 有限写），不复用 Java/r-nacos 的 HTTP 管理面。
+- **配置中心**：hashicorp/raft 纯日志+快照存储（无额外数据文件，与 r-nacos 0.8.x / jaws-harbor 同构），写路径全部过 raft；配置历史在 FSM 内每 key 保留最近 100 版本（含当前），随快照持久化。
+- **命名服务**：临时实例内存态，活性 = 连接（gRPC 模型无 beat），不过 raft，跨节点同步为连接级 AP（`internal/naming/sync`）；持久实例（ephemeral=false）注册/注销过 raft（CP），健康由每节点本地 TCP 探测维护（与 r-nacos 同构）。
 - **测试客户端**：直接用 sweet（手写 Nacos 协议客户端，已对活 Nacos 3.2.3 验证），不用 nacos-sdk-go。
 - Go 版本与 sweet 对齐：`go 1.27.3`，grpc `v1.84.0`，protobuf `v1.36.12`。
 
@@ -36,9 +36,12 @@ graph TD
     U --> NAM[naming.Service]
     S --> CONN[conn.Registry]
     CFG -->|Apply| RAFT[raftnode]
-    RAFT --> FSM[config.FSM]
-    FSM --> BB[(bbolt 状态)]
-    RAFT --> LOG[(raft-boltdb 日志+快照)]
+    NAM -->|持久实例写| RAFT
+    RAFT --> FSM[fsm.Router 组合状态机]
+    FSM --> CFGFSM[config.FSM 含历史]
+    FSM --> NAMFSM[naming 持久实例]
+    RAFT --> LOG[(raft-boltdb 日志+快照，唯一持久层)]
+    NAM -->|持久实例 TCP 探测| NAM
     CFG -->|notify| CONN
     NAM -->|push| CONN
     CONN -->|推送+ack| S
@@ -60,8 +63,9 @@ graph TD
 | 信封类型 | 直接复用 `sweet/gen`（Payload/Metadata）；手写 ServiceDesc，不用 protoc-gen-go-grpc |
 | `internal/wire` | 信封编解码 + 全部 JSON DTO（tag 与 sweet 逐字对齐） |
 | `internal/conn` | 连接注册表（peer addr → connection）、推送 ack 重试、断连清理钩子；connID 带 nodeID 前缀（集群唯一） |
-| `internal/config` | bbolt 存储、raft FSM（CAS 在 Apply 内、OnChange 钩子）、listen/notify 服务、非 leader 写转发 |
-| `internal/naming` | 内存实例表（entry 带 originNode 归属）+ 独立订阅索引 + 空服务清理器，连接即活性；远端 apply 路径永不 emit |
+| `internal/fsm` | 组合 raft 状态机：Envelope 按 domain（config/naming）分发；共享 Writer（leader 直写 / follower 转发，兼作 cluster.Applier） |
+| `internal/config` | 纯 raft FSM（CAS 在 Apply 内、OnChange 钩子、每 key 100 版本历史随快照）、listen/notify 服务 |
+| `internal/naming` | 内存实例表（entry 带 originNode 归属）+ 独立订阅索引 + 空服务清理器，连接即活性；持久实例过 raft + 本地 TCP 探测；远端 apply 路径永不 emit |
 | `internal/naming/sync` | 临时实例跨节点 AP 同步：增量广播、12s 全量对账、3s ping/15s 判死、snapshot 拉取 |
 | `internal/cluster` | 内部节点间 gRPC 服务（注册在 SDK gRPC server 上，同端口）：join/remove/forward/sync/snapshot，Payload 信封 + JSON body |
 | `internal/raftnode` | hashicorp/raft 组装：bolt log+stable、file snapshot、TCP transport、bootstrap/join、成员表访问器 |
@@ -74,8 +78,8 @@ graph TD
 
 1. **连接身份 = peer addr**。对齐 Nacos "transport 派生" 思路：同一 TCP 连接上的 unary 与 bidi 天然共享身份，无需客户端回传 connectionId。
 2. **流断即清理**（有意偏差）：Nacos 是 TCP 断才清理，go-nacos 在 bidi 流结束时清理。sweet 重连必重放（replay），语义等价；已用 e2e 重放测试锁定。
-3. **配置写路径确定性**：CAS 判断在 FSM.Apply 内（所有节点同序执行）；时间戳由 leader 在 Command 里盖章；Apply 同步写 bbolt，publish 成功即可读（无 Nacos 的 dump 延迟窗口）。
-4. **临时实例不过 raft（M2 定稿路线 A）**：连接级 AP 同步，与 r-nacos 同构——增量广播（per-peer 队列、失败重试一次）+ 12s 全量 connID→instances 对账（双向收敛）+ 独立 3s ping/15s 无活动判死清理 + 新节点 snapshot 全量拉取。raft 只管 config 与成员表；死亡检测不依赖 raft 成员观测，raft 失多数派时 naming 仍 AP 可用。
+3. **配置写路径确定性**：CAS 判断在 FSM.Apply 内（所有节点同序执行）；时间戳由 leader 在 Command 里盖章；持久性完全由 raft 日志（raft-boltdb 同步落盘）+ 快照承担，无额外数据文件（r-nacos 0.3.7 起同构），publish 成功即可读（无 Nacos 的 dump 延迟窗口）。启动恢复 = 快照 Restore + raft Barrier 等待尾日志回放（NewRaft 只恢复快照，尾日志在重新选主后才提交回放，Start 必须 barrier 后才对外服务）。配置历史在 FSM 内每 key 保留最近 100 版本（含当前，r-nacos histories 语义），删除配置即丢历史；admin `GET /api/config/history` 可查。
+4. **临时实例不过 raft（M2 定稿路线 A）**：连接级 AP 同步，与 r-nacos 同构——增量广播（per-peer 队列、失败重试一次）+ 12s 全量 connID→instances 对账（双向收敛）+ 独立 3s ping/15s 无活动判死清理 + 新节点 snapshot 全量拉取。raft 承载 config、持久实例与成员表；死亡检测不依赖 raft 成员观测，raft 失多数派时临时实例 naming 仍 AP 可用。
 5. **推送 ack 完整复刻**：3s 超时、0/2/4s 重试、3 次失败注销连接；ack 唤醒后检查 closed 防误判。
 6. **GracefulStop 前先退役连接**：bidi 长活流不会自己结束，直接 GracefulStop 会挂起。
 7. **connectionId 加节点前缀与原子序号**：`nodeID_millis_seq_peer`，集群唯一且防同毫秒重连碰撞；deregister 仅 connID 守卫即可跨节点安全（admin 强制下线可在副本持有节点发起）。
@@ -89,6 +93,7 @@ graph TD
 15. **内部传输复用 SDK gRPC 端口**：hashicorp/raft 的 transport 只做共识（r-nacos 自带 raft 网络层可复用，我们不能），join/forward/naming 同步是注册在 SDK gRPC server 上的独立 Cluster 服务（同端口 9848、不同 service，Java Nacos 的 server gRPC 同样多路复用），手写 ServiceDesc、复用 sweet/gen.Payload 信封 + JSON body；不另开端口，SDK 协议零改动。
 16. **端口对齐 Java Nacos**：以主端口 8848 为基准的官方偏移——gRPC +1000=9848（SDK 与节点间内部 RPC 复用）、raft -1000=7848；控制台 8080（Nacos 3.x 独立控制台端口，不偏移）。Java 的 +1001=9849 服务端 gRPC 端口在 go-nacos 里不需要（内部 RPC 已并入 9848）；go-nacos 无 1.x HTTP OpenAPI，故不监听 8848 本身。
 17. **节点移除（缩容）**：内部 `/Cluster/remove` 仅 leader 执行、follower 回 LeaderID 重定向、目标缺席幂等 OK、末位 voter 拒绝（配置清空即永久死亡）；admin `DELETE /api/raft/member` 是唯一入口（不做 `-leave`，重启语义优先）。naming 副本清理走**成员差集 sweep**：pingLoop 每 tick 删除 originNode 不在 voter 表的条目（`PurgeAbsentNodes`），成员表驱动而非事件广播——自愈、零新消息，与“对账兜底”一致；崩溃节点仍是 voter 故不触发，独立 ping 判死职责不变（失多数派不误清）。被移除节点 `watchMembership`（Start 成功后武装，1s tick）检测自身不在配置表即优雅 Stop 自动停服；离线重启的旧身份节点同样据此拒绝服务。
+18. **持久实例 CP + 本地探测（对齐 r-nacos）**：`ephemeral=false` 的注册/注销是 raft 命令（fsm.DomainNaming），全节点同序 apply，重启/节点死亡后存活；条目不绑连接（connID/originNode 为空），所有 AP 同步/清理路径双向跳过持久条目（进来的持久声明忽略，本地持久条目永不被 AP 删除/覆盖），AP 全量对账与 snapshot 拉取只携带临时实例。健康状态每节点本地 TCP 探测（默认 60s 周期/1s 超时、失败重试一次，r-nacos sniffing 同构），探测结果不过 raft，只改本地 + 推订阅者；unhealthy 只标记不删除。同端点持久条目只能被 raft 命令替换，临时注册拒绝抢占；JSON 缺省 ephemeral 字段按 true 处理（Java Instance pojo 默认值）。持久实例随组合快照持久化，新节点经 raft 复制自动获得。
 
 ## 里程碑
 
@@ -99,6 +104,7 @@ graph TD
 - **M2a（已完成）**：raft 组集群——首节点 BootstrapCluster、其余 Join（非 leader 重定向）、config 写 leader 路由/转发、FSM 变更钩子全节点推本地监听者、成员表暴露；e2e 锁定 follower 转发写与双向 watch。
 - **M2b（已完成）**：临时实例跨节点同步——`internal/naming/sync`（增量广播/12s 对账/3s ping 15s 判死/snapshot 拉取）+ 内部 gRPC 五种 JSON 消息；e2e 锁定双节点互见+跨节点推送、杀节点 15s 内清理（raft 失多数派仍 AP）、新节点全量拉取、丢增量靠对账收敛。
 - **节点移除（已完成）**：`/Cluster/remove` + admin 入口、naming 成员差集 sweep、被移除节点自动停服；e2e 锁定 follower/leader 移除、follower 重定向、末位守卫、移除后重 join，并保留失多数派 death 回归。
+- **纯 raft 存储 + 持久实例（已完成）**：去掉 config.db bbolt 副本（`internal/fsm` 组合状态机，快照格式变更为 domain 信封，旧 data 目录需重建）；配置历史进 FSM 随快照（100 版本上限 + admin 查询端点）；naming 持久实例过 raft + 本地 TCP 探测，与临时实例 AP 链路完全隔离；e2e 锁定历史重启存活、持久实例断连/重启/节点死亡存活、探测翻转与 follower 转发注册。
 - **M3（按需）**：鉴权、更多 ability 协商。
 
 ## 运行与测试

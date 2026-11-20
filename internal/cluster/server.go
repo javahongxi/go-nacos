@@ -13,8 +13,8 @@ import (
 	"github.com/javahongxi/sweet/gen"
 )
 
-// Applier is the leader-side write path (config.Service): apply forwarded
-// command bytes and answer with the domain result, opaque to this package.
+// Applier is the leader-side write path (fsm.Writer): apply forwarded
+// envelope bytes and answer with the domain result, opaque to this package.
 type Applier interface {
 	ApplyForwarded(data []byte) ([]byte, error)
 }
