@@ -34,10 +34,14 @@ const (
 	TypeSyncResponse     = "SyncResponse"
 	TypeSnapshotRequest  = "SnapshotRequest"
 	TypeSnapshotResponse = "SnapshotResponse"
+	TypeRaftIndexRequest  = "RaftIndexRequest"
+	TypeRaftIndexResponse = "RaftIndexResponse"
 )
 
-// JoinRequest asks the cluster to add the caller as a voter. NodeID is the
-// caller's gRPC address (its cluster identity), RaftAddr its raft transport.
+// JoinRequest asks the cluster to add the caller as a voter — via a learner
+// (nonvoter) catch-up phase, so the quorum only grows once the log is replicated.
+// NodeID is the caller's gRPC address (its cluster identity), RaftAddr its raft
+// transport.
 type JoinRequest struct {
 	NodeID   string `json:"nodeId"`
 	RaftAddr string `json:"raftAddr"`
@@ -90,6 +94,15 @@ type SnapshotRequest struct{}
 type SnapshotResponse struct {
 	Data    []byte `json:"data,omitempty"`
 	Message string `json:"message,omitempty"`
+}
+
+// RaftIndexRequest asks a node for its last stored raft log index.
+type RaftIndexRequest struct{}
+
+// RaftIndexResponse reports the node's raft LastIndex — the leader's
+// catch-up gate polls it while a joiner is still a nonvoter.
+type RaftIndexResponse struct {
+	LastIndex uint64 `json:"lastIndex"`
 }
 
 // Client dials peers lazily and caches one connection per address.
@@ -188,6 +201,15 @@ func (c *Client) PullSnapshot(ctx context.Context, addr string) ([]byte, error) 
 		return nil, errors.New(resp.Message)
 	}
 	return resp.Data, nil
+}
+
+// RaftIndex fetches a peer's last stored raft log index (join catch-up gate).
+func (c *Client) RaftIndex(ctx context.Context, addr string) (uint64, error) {
+	var resp RaftIndexResponse
+	if err := c.invoke(ctx, addr, "/Cluster/raftIndex", TypeRaftIndexRequest, RaftIndexRequest{}, &resp); err != nil {
+		return 0, err
+	}
+	return resp.LastIndex, nil
 }
 
 func (c *Client) Close() {

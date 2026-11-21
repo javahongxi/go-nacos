@@ -162,7 +162,7 @@ func (s *Server) raftStatus(w http.ResponseWriter, _ *http.Request) {
 	node := s.raft.Raft
 	members := make([]map[string]string, 0)
 	for _, sv := range s.raft.Voters() {
-		members = append(members, map[string]string{"id": string(sv.ID), "raftAddr": string(sv.Address)})
+		members = append(members, map[string]string{"id": string(sv.ID), "raftAddr": string(sv.Address), "suffrage": sv.Suffrage.String()})
 	}
 	writeJSON(w, map[string]any{
 		"state":   node.State().String(),

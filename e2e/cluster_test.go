@@ -2,8 +2,11 @@ package e2e
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"net/http"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -519,4 +522,205 @@ func TestClusterRemovedRejoin(t *testing.T) {
 	consumer2b := newNaming(t, a2b.Addr())
 	waitQueryHosts(t, ctx, consumer2b, svc, 1)
 	waitMembers(t, a1, a1.Addr(), grpcAddr)
+}
+
+// raftMemberTable reads id → suffrage from a node's console.
+func raftMemberTable(t *testing.T, a *app.App) map[string]string {
+	t.Helper()
+	var rs struct {
+		Members []struct {
+			ID       string `json:"id"`
+			Suffrage string `json:"suffrage"`
+		} `json:"members"`
+	}
+	adminGet(t, "http://"+a.AdminAddr()+"/api/raft", &rs)
+	m := make(map[string]string, len(rs.Members))
+	for _, x := range rs.Members {
+		m[x.ID] = x.Suffrage
+	}
+	return m
+}
+
+// waitSuffrage polls until the member holds the wanted suffrage.
+func waitSuffrage(t *testing.T, a *app.App, id, want string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if got := raftMemberTable(t, a)[id]; got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("member %s on %s never reached suffrage %s (table=%v)", id, a.Addr(), want, raftMemberTable(t, a))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestClusterJoinLearnerPhase locks the learner gate: while the joiner
+// catches up it is a Nonvoter — the voter set (and thus the quorum) stays
+// unchanged and the leader keeps committing alone — and promotion happens
+// only after the joiner holds the log.
+func TestClusterJoinLearnerPhase(t *testing.T) {
+	a1 := newClusterApp(t, t.TempDir(), "")
+	c1 := newConfig(t, a1.Addr())
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	key := nacos.ConfigKey{DataID: "learner.yaml", Group: "DEFAULT_GROUP"}
+	if err := c1.Publish(ctx, key, nacos.PublishInput{Content: "before-join"}); err != nil {
+		t.Fatalf("publish before join: %v", err)
+	}
+	// Some log bulk so catch-up is real work, not a no-op.
+	bulk := nacos.ConfigKey{DataID: "learner-bulk.yaml", Group: "DEFAULT_GROUP"}
+	if err := c1.Publish(ctx, bulk, nacos.PublishInput{Content: strings.Repeat("x", 256<<10)}); err != nil {
+		t.Fatalf("publish bulk: %v", err)
+	}
+
+	// A wide probe cadence guarantees an observable learner window: the
+	// gate sleeps one poll before its first probe.
+	a2, err := app.New(app.Options{
+		GRPCListen: "127.0.0.1:0", RaftListen: "127.0.0.1:0", AdminListen: "127.0.0.1:0",
+		DataDir: t.TempDir(), JoinAddr: a1.Addr(),
+		JoinCatchUpPoll: 500 * time.Millisecond,
+		Logger:          discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("app.New a2: %v", err)
+	}
+	t.Cleanup(a2.Stop)
+	started := make(chan error, 1)
+	go func() { started <- a2.Start() }()
+
+	// Catch the learner window on the leader's member table.
+	var table map[string]string
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		table = raftMemberTable(t, a1)
+		if table[a2.Addr()] == "Nonvoter" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("never observed the learner phase (table=%v)", table)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Quorum unchanged: the joiner is present but only a1 votes.
+	numVoters := 0
+	for _, s := range table {
+		if s == "Voter" {
+			numVoters++
+		}
+	}
+	if numVoters != 1 {
+		t.Fatalf("voter count during learner phase = %d, want 1 (table=%v)", numVoters, table)
+	}
+	// The lone voter still commits while the learner catches up.
+	during := nacos.ConfigKey{DataID: "during-learner.yaml", Group: "DEFAULT_GROUP"}
+	if err := c1.Publish(ctx, during, nacos.PublishInput{Content: "quorum-1"}); err != nil {
+		t.Fatalf("publish during learner phase: %v", err)
+	}
+
+	if err := <-started; err != nil {
+		t.Fatalf("a2.Start: %v", err)
+	}
+	// Promotion after catch-up: a2 votes and serves the pre-join log.
+	waitSuffrage(t, a1, a2.Addr(), "Voter")
+	waitMembers(t, a1, a1.Addr(), a2.Addr())
+	c2 := newConfig(t, a2.Addr())
+	for _, k := range []nacos.ConfigKey{key, bulk, during} {
+		want := "before-join"
+		switch k {
+		case bulk:
+			want = strings.Repeat("x", 256<<10)
+		case during:
+			want = "quorum-1"
+		}
+		qdeadline := time.Now().Add(5 * time.Second)
+		for {
+			got, err := c2.Query(ctx, k)
+			if err == nil && got.Content == want {
+				break
+			}
+			if time.Now().After(qdeadline) {
+				t.Fatalf("a2 query %s: %+v err=%v, want caught-up content", k.DataID, got, err)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+}
+
+// TestClusterJoinLearnerResume locks the interrupted-join path: a joiner
+// that dies mid-catch-up stays a Nonvoter (never promoted, quorum intact),
+// and restarting it with the same identity resumes the gate to promotion.
+func TestClusterJoinLearnerResume(t *testing.T) {
+	a1 := newClusterApp(t, t.TempDir(), "")
+	c1 := newConfig(t, a1.Addr())
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	key := nacos.ConfigKey{DataID: "resume.yaml", Group: "DEFAULT_GROUP"}
+	if err := c1.Publish(ctx, key, nacos.PublishInput{Content: "durable"}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	// Pin both ports: the restart must keep the gRPC identity AND the raft
+	// transport address registered in the leader's configuration.
+	grpcAddr := pinnedGRPCListen(t)
+	raftAddr := pinnedGRPCListen(t)
+	dir := t.TempDir()
+	opts := app.Options{
+		GRPCListen: grpcAddr, RaftListen: raftAddr, AdminListen: "127.0.0.1:0",
+		DataDir: dir, JoinAddr: a1.Addr(),
+		JoinCatchUpPoll: 2 * time.Second,
+		Logger:          discardLogger(),
+	}
+	a2, err := app.New(opts)
+	if err != nil {
+		t.Fatalf("app.New a2: %v", err)
+	}
+	t.Cleanup(a2.Stop)
+	go func() { _ = a2.Start() }()
+
+	waitSuffrage(t, a1, grpcAddr, "Nonvoter")
+	// Crash the joiner mid-catch-up: the gate's RPC context dies with it,
+	// so the leader must NOT promote a dead node.
+	a2.HardStop()
+	time.Sleep(500 * time.Millisecond)
+	if got := raftMemberTable(t, a1)[grpcAddr]; got != "Nonvoter" {
+		t.Fatalf("dead joiner suffrage = %q, want stranded Nonvoter", got)
+	}
+	// Quorum intact: the lone voter keeps writing.
+	if err := c1.Publish(ctx, key, nacos.PublishInput{Content: "after-crash"}); err != nil {
+		t.Fatalf("publish while joiner stranded: %v", err)
+	}
+
+	// Same identity, same data dir: the re-join resumes at the gate and
+	// promotes once caught up.
+	a2b, err := app.New(opts)
+	if err != nil {
+		t.Fatalf("app.New a2b: %v", err)
+	}
+	t.Cleanup(a2b.Stop)
+	if err := a2b.Start(); err != nil {
+		t.Fatalf("a2b.Start: %v", err)
+	}
+	waitSuffrage(t, a1, grpcAddr, "Voter")
+	waitMembers(t, a1, a1.Addr(), grpcAddr)
+	c2 := newConfig(t, a2b.Addr())
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got, err := c2.Query(ctx, key)
+		if err == nil && got.Content == "after-crash" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("a2b query after resume: %+v err=%v", got, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// discardLogger silences app logs in tests that build app.Options by hand.
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }

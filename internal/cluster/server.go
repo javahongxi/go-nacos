@@ -32,25 +32,55 @@ type Syncer interface {
 // way). Lifecycle belongs to that server.
 type Server struct {
 	node    *raftnode.Node
+	client  *Client // probes the joiner's log progress during the learner phase
 	applier Applier
 	syncer  Syncer
 	logger  *slog.Logger
+
+	catchUpPoll    time.Duration // learner catch-up probe cadence
+	catchUpTimeout time.Duration // promote anyway once this budget runs out
 }
 
-func NewServer(node *raftnode.Node, applier Applier, syncer Syncer, logger *slog.Logger) *Server {
+// Option tunes a Server at construction.
+type Option func(*Server)
+
+// WithCatchUp overrides the learner catch-up gate timing (zero values keep
+// the defaults: 100ms poll, 10s budget). Tests widen the poll to make the
+// learner window observable.
+func WithCatchUp(poll, timeout time.Duration) Option {
+	return func(s *Server) {
+		if poll > 0 {
+			s.catchUpPoll = poll
+		}
+		if timeout > 0 {
+			s.catchUpTimeout = timeout
+		}
+	}
+}
+
+func NewServer(node *raftnode.Node, client *Client, applier Applier, syncer Syncer, logger *slog.Logger, opts ...Option) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{node: node, applier: applier, syncer: syncer, logger: logger}
+	s := &Server{
+		node: node, client: client, applier: applier, syncer: syncer, logger: logger,
+		catchUpPoll: 100 * time.Millisecond, catchUpTimeout: 10 * time.Second,
+	}
+	for _, f := range opts {
+		f(s)
+	}
+	return s
 }
 
 // Register attaches the Cluster service to an existing gRPC server.
 func (s *Server) Register(g *grpc.Server) { g.RegisterService(&clusterDesc, s) }
 
-// handleJoin adds the caller as a voter. Only the leader mutates membership;
-// a follower answers with the leader's id (its gRPC address, since ServerID
-// IS the gRPC address) so the joiner can retry there.
-func (s *Server) handleJoin(_ context.Context, p *gen.Payload) (*gen.Payload, error) {
+// handleJoin admits the caller in two steps: AddNonvoter (learner — receives
+// the log but does not vote, so the quorum is unchanged), then promotion to
+// voter once the joiner's log has caught up. Only the leader mutates
+// membership; a follower answers with the leader's id (its gRPC address,
+// since ServerID IS the gRPC address) so the joiner can retry there.
+func (s *Server) handleJoin(ctx context.Context, p *gen.Payload) (*gen.Payload, error) {
 	var req JoinRequest
 	if err := wire.Decode(p, &req); err != nil {
 		return nil, err
@@ -63,21 +93,76 @@ func (s *Server) handleJoin(_ context.Context, p *gen.Payload) (*gen.Payload, er
 		_, leaderID := r.LeaderWithID()
 		return wire.NewPayload(TypeJoinResponse, JoinResponse{LeaderID: string(leaderID), Message: "not leader"})
 	}
-	// A restart with existing state re-joins idempotently.
+	// A restart with existing state re-joins idempotently; a stranded
+	// nonvoter (an interrupted earlier join) resumes at the catch-up gate.
+	learner := false
 	for _, srv := range s.node.Voters() {
 		if string(srv.ID) == req.NodeID {
-			if string(srv.Address) == req.RaftAddr {
+			if string(srv.Address) != req.RaftAddr {
+				return wire.NewPayload(TypeJoinResponse, JoinResponse{Message: "node id already registered with a different raft address"})
+			}
+			if srv.Suffrage == raft.Voter {
 				return wire.NewPayload(TypeJoinResponse, JoinResponse{OK: true})
 			}
-			return wire.NewPayload(TypeJoinResponse, JoinResponse{Message: "node id already registered with a different raft address"})
+			learner = true
+			break
 		}
+	}
+	if !learner {
+		f := r.AddNonvoter(raft.ServerID(req.NodeID), raft.ServerAddress(req.RaftAddr), 0, 10*time.Second)
+		if err := f.Error(); err != nil {
+			return wire.NewPayload(TypeJoinResponse, JoinResponse{Message: err.Error()})
+		}
+		s.logger.Info("cluster: learner added", "node", req.NodeID, "raft", req.RaftAddr)
+	}
+	// Catch-up gate: the joiner must hold the log as of admission before it
+	// votes. hashicorp/raft exposes no per-peer matchIndex, so poll the
+	// joiner's own LastIndex over the internal gRPC channel.
+	target := r.LastIndex()
+	caughtUp, leaderID := s.waitCatchUp(ctx, req.NodeID, target)
+	if leaderID != "" { // lost leadership mid-gate: the joiner retries there
+		return wire.NewPayload(TypeJoinResponse, JoinResponse{LeaderID: leaderID, Message: "not leader"})
+	}
+	if ctx.Err() != nil { // joiner gave up or died: leave it a learner, a later join resumes
+		return wire.NewPayload(TypeJoinResponse, JoinResponse{Message: "join canceled during catch-up"})
+	}
+	if !caughtUp {
+		s.logger.Warn("cluster: catch-up timed out, promoting anyway", "node", req.NodeID, "target", target)
 	}
 	f := r.AddVoter(raft.ServerID(req.NodeID), raft.ServerAddress(req.RaftAddr), 0, 10*time.Second)
 	if err := f.Error(); err != nil {
 		return wire.NewPayload(TypeJoinResponse, JoinResponse{Message: err.Error()})
 	}
-	s.logger.Info("cluster: voter added", "node", req.NodeID, "raft", req.RaftAddr)
+	s.logger.Info("cluster: voter added", "node", req.NodeID, "raft", req.RaftAddr, "caughtUp", caughtUp)
 	return wire.NewPayload(TypeJoinResponse, JoinResponse{OK: true})
+}
+
+// waitCatchUp polls the joiner's last log index until it reaches target.
+// Returns caughtUp, or a non-empty leaderID when this node lost leadership
+// (the caller redirects). Probe errors are retried — the joiner's gRPC may
+// still be warming up; the timeout is the backstop.
+func (s *Server) waitCatchUp(ctx context.Context, nodeID string, target uint64) (bool, string) {
+	deadline := time.Now().Add(s.catchUpTimeout)
+	for {
+		select {
+		case <-ctx.Done():
+			return false, ""
+		case <-time.After(s.catchUpPoll):
+		}
+		if s.node.Raft.State() != raft.Leader {
+			_, leaderID := s.node.Raft.LeaderWithID()
+			return false, string(leaderID)
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, s.catchUpPoll)
+		idx, err := s.client.RaftIndex(probeCtx, nodeID)
+		cancel()
+		if err == nil && idx >= target {
+			return true, ""
+		}
+		if time.Now().After(deadline) {
+			return false, ""
+		}
+	}
 }
 
 // handleRemove drops a voter (scale-down). Like join, only the leader mutates
@@ -98,17 +183,26 @@ func (s *Server) handleRemove(_ context.Context, p *gen.Payload) (*gen.Payload, 
 	}
 	voters := s.node.Voters()
 	found := false
+	numVoters := 0
 	for _, srv := range voters {
+		if srv.Suffrage == raft.Voter {
+			numVoters++
+		}
 		if string(srv.ID) == req.NodeID {
 			found = true
-			break
 		}
 	}
 	if !found {
 		return wire.NewPayload(TypeRemoveResponse, RemoveResponse{OK: true}) // already absent
 	}
-	if len(voters) <= 1 {
-		return wire.NewPayload(TypeRemoveResponse, RemoveResponse{Message: "cannot remove the last voter"})
+	// Only voters count towards the quorum — a learner must not mask the
+	// last-voter guard.
+	if numVoters <= 1 {
+		for _, srv := range voters {
+			if string(srv.ID) == req.NodeID && srv.Suffrage == raft.Voter {
+				return wire.NewPayload(TypeRemoveResponse, RemoveResponse{Message: "cannot remove the last voter"})
+			}
+		}
 	}
 	f := r.RemoveServer(raft.ServerID(req.NodeID), 0, 10*time.Second)
 	if err := f.Error(); err != nil {
@@ -161,6 +255,13 @@ func (s *Server) handleSnapshot(_ context.Context, _ *gen.Payload) (*gen.Payload
 	return wire.NewPayload(TypeSnapshotResponse, SnapshotResponse{Data: data})
 }
 
+// handleRaftIndex reports this node's last stored log index — the leader's
+// catch-up gate polls the joiner here (matchIndex is not exported by the
+// raft library).
+func (s *Server) handleRaftIndex(_ context.Context, _ *gen.Payload) (*gen.Payload, error) {
+	return wire.NewPayload(TypeRaftIndexResponse, RaftIndexResponse{LastIndex: s.node.Raft.LastIndex()})
+}
+
 // clusterAPI is the HandlerType the ServiceDesc checks against — the same
 // hand-written-desc pattern as grpcserver (no protoc-gen-go-grpc).
 type clusterAPI interface {
@@ -169,6 +270,7 @@ type clusterAPI interface {
 	handleForward(context.Context, *gen.Payload) (*gen.Payload, error)
 	handleSync(context.Context, *gen.Payload) (*gen.Payload, error)
 	handleSnapshot(context.Context, *gen.Payload) (*gen.Payload, error)
+	handleRaftIndex(context.Context, *gen.Payload) (*gen.Payload, error)
 }
 
 // unaryMethod builds one MethodDesc; every internal RPC is Payload→Payload.
@@ -211,6 +313,9 @@ var clusterDesc = grpc.ServiceDesc{
 		}),
 		unaryMethod("snapshot", func(a clusterAPI, ctx context.Context, p *gen.Payload) (*gen.Payload, error) {
 			return a.handleSnapshot(ctx, p)
+		}),
+		unaryMethod("raftIndex", func(a clusterAPI, ctx context.Context, p *gen.Payload) (*gen.Payload, error) {
+			return a.handleRaftIndex(ctx, p)
 		}),
 	},
 }

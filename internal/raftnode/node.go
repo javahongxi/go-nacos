@@ -106,7 +106,9 @@ func (n *Node) NodeID() string { return n.nodeID }
 func (n *Node) RaftAddr() string { return string(n.transport.LocalAddr()) }
 
 // Voters lists the current raft configuration — the cluster member table the
-// naming sync module builds on. ID is the member's gRPC address.
+// naming sync module builds on. ID is the member's gRPC address. Includes
+// nonvoters (learners catching up before promotion); check Suffrage when
+// only voting members matter.
 func (n *Node) Voters() []raft.Server {
 	f := n.Raft.GetConfiguration()
 	if err := f.Error(); err != nil {

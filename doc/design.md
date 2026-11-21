@@ -92,7 +92,7 @@ graph TD
 14. **FSM OnChange 钩子**：每节点 Apply 变更后各推本地监听者，3+ 节点 config watch 不漏、零额外 RPC；钩子在释放 FSM 锁后调用，防与 Listen 的锁序倒置。follower 读/订阅种子经 AppendEntries 异步追赶，属正常 raft 语义。
 15. **内部传输复用 SDK gRPC 端口**：hashicorp/raft 的 transport 只做共识（r-nacos 自带 raft 网络层可复用，我们不能），join/forward/naming 同步是注册在 SDK gRPC server 上的独立 Cluster 服务（同端口 9848、不同 service，Java Nacos 的 server gRPC 同样多路复用），手写 ServiceDesc、复用 sweet/gen.Payload 信封 + JSON body；不另开端口，SDK 协议零改动。
 16. **端口对齐 Java Nacos**：以主端口 8848 为基准的官方偏移——gRPC +1000=9848（SDK 与节点间内部 RPC 复用）、raft -1000=7848；控制台 8080（Nacos 3.x 独立控制台端口，不偏移）。Java 的 +1001=9849 服务端 gRPC 端口在 go-nacos 里不需要（内部 RPC 已并入 9848）；go-nacos 无 1.x HTTP OpenAPI，故不监听 8848 本身。
-17. **节点移除（缩容）**：内部 `/Cluster/remove` 仅 leader 执行、follower 回 LeaderID 重定向、目标缺席幂等 OK、末位 voter 拒绝（配置清空即永久死亡）；admin `DELETE /api/raft/member` 是唯一入口（不做 `-leave`，重启语义优先）。naming 副本清理走**成员差集 sweep**：pingLoop 每 tick 删除 originNode 不在 voter 表的条目（`PurgeAbsentNodes`），成员表驱动而非事件广播——自愈、零新消息，与“对账兜底”一致；崩溃节点仍是 voter 故不触发，独立 ping 判死职责不变（失多数派不误清）。被移除节点 `watchMembership`（Start 成功后武装，1s tick）检测自身不在配置表即优雅 Stop 自动停服；离线重启的旧身份节点同样据此拒绝服务。
+17. **节点变更（扩容/缩容）**：扩容走 learner 门槛 join——`AddNonvoter`（quorum 不变）→ 经 `/Cluster/raftIndex` 轮询 joiner LastIndex 追平（hashicorp/raft 不导出 matchIndex；默认 100ms/10s，超时兜底照样转正）→ `AddVoter`；中断留 Nonvoter、同身份续 join 恢复。缩容：内部 `/Cluster/remove` 仅 leader 执行、follower 回 LeaderID 重定向、目标缺席幂等 OK、末位 voter 拒绝（只数 Voter，learner 不掩盖守卫；配置清空即永久死亡）；admin `DELETE /api/raft/member` 是唯一入口（不做 `-leave`，重启语义优先）。naming 副本清理走**成员差集 sweep**：pingLoop 每 tick 删除 originNode 不在 voter 表的条目（`PurgeAbsentNodes`），成员表驱动而非事件广播——自愈、零新消息，与“对账兜底”一致；崩溃节点仍是 voter 故不触发，独立 ping 判死职责不变（失多数派不误清）。被移除节点 `watchMembership`（Start 成功后武装，1s tick）检测自身不在配置表即优雅 Stop 自动停服；离线重启的旧身份节点同样据此拒绝服务。设计与用法详见 [cluster.md](cluster.md)。
 18. **持久实例 CP + 本地探测（对齐 r-nacos）**：`ephemeral=false` 的注册/注销是 raft 命令（fsm.DomainNaming），全节点同序 apply，重启/节点死亡后存活；条目不绑连接（connID/originNode 为空），所有 AP 同步/清理路径双向跳过持久条目（进来的持久声明忽略，本地持久条目永不被 AP 删除/覆盖），AP 全量对账与 snapshot 拉取只携带临时实例。健康状态每节点本地 TCP 探测（默认 60s 周期/1s 超时、失败重试一次，r-nacos sniffing 同构），探测结果不过 raft，只改本地 + 推订阅者；unhealthy 只标记不删除。同端点持久条目只能被 raft 命令替换，临时注册拒绝抢占；JSON 缺省 ephemeral 字段按 true 处理（Java Instance pojo 默认值）。持久实例随组合快照持久化，新节点经 raft 复制自动获得。
 
 ## 里程碑
@@ -104,6 +104,7 @@ graph TD
 - **M2a（已完成）**：raft 组集群——首节点 BootstrapCluster、其余 Join（非 leader 重定向）、config 写 leader 路由/转发、FSM 变更钩子全节点推本地监听者、成员表暴露；e2e 锁定 follower 转发写与双向 watch。
 - **M2b（已完成）**：临时实例跨节点同步——`internal/naming/sync`（增量广播/12s 对账/3s ping 15s 判死/snapshot 拉取）+ 内部 gRPC 五种 JSON 消息；e2e 锁定双节点互见+跨节点推送、杀节点 15s 内清理（raft 失多数派仍 AP）、新节点全量拉取、丢增量靠对账收敛。
 - **节点移除（已完成）**：`/Cluster/remove` + admin 入口、naming 成员差集 sweep、被移除节点自动停服；e2e 锁定 follower/leader 移除、follower 重定向、末位守卫、移除后重 join，并保留失多数派 death 回归。
+- **learner 门槛 join（已完成）**：扩容改为 AddNonvoter → raftIndex 探测追平 → AddVoter，quorum 只在追平后变大；超时兜底转正、中断留 Nonvoter 续 join 恢复、末位守卫只数 Voter；admin 成员表暴露 suffrage；e2e 锁定 learner 窗口 quorum 不变与中断续 join。
 - **纯 raft 存储 + 持久实例（已完成）**：去掉 config.db bbolt 副本（`internal/fsm` 组合状态机，快照格式变更为 domain 信封，旧 data 目录需重建）；配置历史进 FSM 随快照（100 版本上限 + admin 查询端点）；naming 持久实例过 raft + 本地 TCP 探测，与临时实例 AP 链路完全隔离；e2e 锁定历史重启存活、持久实例断连/重启/节点死亡存活、探测翻转与 follower 转发注册。
 - **M3（按需）**：鉴权、更多 ability 协商。
 
@@ -121,6 +122,6 @@ go run ./cmd/gonacos -listen 127.0.0.1:9858 -raft-listen 127.0.0.1:7858 -admin-l
 go test ./e2e -v
 ```
 
-观测台：`http://127.0.0.1:8080`（`-admin-listen off` 可禁用；读 + 有限写，暂不鉴权）。
+观测台：`http://127.0.0.1:8080`（`-admin-listen off` 可禁用；读 + 有限写，暂不鉴权）。集群与节点变更（learner 门槛 join、缩容、重启语义）的设计与示例见 [cluster.md](cluster.md)。
 
 sweet 依赖已发布的 `v1.0.1`（go.mod 无 replace，别人 clone go-nacos 后 `go test ./e2e` 即从代理拉取，无需同级 sweet）。本地开发用 gitignored 的 `go.work`（`use . ../sweet`）覆盖到本地源码；`GOWORK=off go test ./e2e` 可验证不依赖本地 sweet 的可移植路径。

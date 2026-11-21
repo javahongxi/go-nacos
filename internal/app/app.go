@@ -36,6 +36,9 @@ type Options struct {
 
 	NamingProbeInterval time.Duration // persistent-instance probe cadence, zero = 60s (r-nacos default)
 	NamingProbeTimeout  time.Duration // persistent-instance probe dial timeout, zero = 1s
+
+	JoinCatchUpPoll    time.Duration // learner catch-up probe cadence, zero = 100ms
+	JoinCatchUpTimeout time.Duration // learner catch-up budget before promoting anyway, zero = 10s
 }
 
 type App struct {
@@ -124,7 +127,8 @@ func New(opts Options) (*App, error) {
 	}
 	syncMgr := nsync.New(nodeID, namingSvc, clusterClient, peers, opts.Logger)
 	namingSvc.SetEmitter(syncMgr)
-	clusterSrv := cluster.NewServer(node, writer, syncMgr, opts.Logger)
+	clusterSrv := cluster.NewServer(node, clusterClient, writer, syncMgr, opts.Logger,
+		cluster.WithCatchUp(opts.JoinCatchUpPoll, opts.JoinCatchUpTimeout))
 	srv := grpcserver.New(conns, cfg, namingSvc, opts.Logger)
 	clusterSrv.Register(srv.Raw())
 
